@@ -21,10 +21,9 @@ type AppendEntriesMsg struct {
 	Entries []LogEntry
 	LeaderCommit uint64
 
+	// Fields send in the response message
 	Success bool
-	//MatchIndex uint64
-	//FollowerID string
-
+	CurrentTerm uint64 // TODO: Not sure if this is needed, but specified in the Raft paper
 }
 
 type Message struct {
