@@ -104,15 +104,25 @@ func (node *RaftNode) broadcast() {
 }
 
 func (node *RaftNode) sendAppendEntriesToFollower(peer peer) {
+	// 8000 should work for all cloud environments with jumbo frames enabled
+	const maxEntriesBytes = 8000
 	node.mutex.Lock()
 	nextIndex := node.NextIndex[peer.Id]
 	var prevLogTerm uint64
-	if nextIndex > 0 && nextIndex <= uint64(len(node.Log)) {
+	logLength := uint64(len(node.Log))
+	if nextIndex > 0 && nextIndex <= logLength {
 		prevLogTerm = uint64(node.Log[nextIndex-1].Term)
 	}
 	var entries []LogEntry
-	if nextIndex < uint64(len(node.Log)) {
-		entries = []LogEntry{node.Log[nextIndex]}
+	entries = []LogEntry{}
+	entriesSize := 0
+	for i := nextIndex; i < logLength; i++ {
+		entrySize := 14 + len(node.Log[i].Payload)
+		if entrySize+entriesSize > maxEntriesBytes {
+			break
+		}
+		entries = append(entries, node.Log[i])
+		entriesSize += entrySize
 	}
 
 	appendEntry := &AppendEntriesMsg{
