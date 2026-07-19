@@ -99,41 +99,20 @@ func (node *RaftNode) broadcast() {
 	node.mutex.Unlock()
 
 	for _, peer := range peers {
-		node.sendEmptyAppendEntriesToFollower(peer)
+		node.sendAppendEntriesToFollower(peer)
 	}
 }
 
-// TODO: Combine sendEmptyAppendEntriesToFollower and sendAppendEntriesToFollower into one function if possible
-func (node *RaftNode) sendEmptyAppendEntriesToFollower(peer peer) {
+func (node *RaftNode) sendAppendEntriesToFollower(peer peer) {
 	node.mutex.Lock()
 	nextIndex := node.NextIndex[peer.Id]
 	var prevLogTerm uint64
 	if nextIndex > 0 && nextIndex <= uint64(len(node.Log)) {
 		prevLogTerm = uint64(node.Log[nextIndex-1].Term)
 	}
-	appendEntry := &AppendEntriesMsg{
-		Term:         node.CurrentTerm,
-		IDofSender:   uint16(node.Id),
-		PrevLogIndex: nextIndex,
-		PrevLogTerm:  prevLogTerm,
-		LeaderCommit: node.CommitIndex,
-	}
-	node.mutex.Unlock()
-
-	message := &Message{MessageType(1), appendEntry, peer.Adress}
-	node.Transport.Send(peer.Adress, message)
-}
-
-func (node *RaftNode) sendAppendEntriesToFollower(peer peer) {
-	node.mutex.Lock()
-	nextIndex := node.NextIndex[peer.Id]
-	if nextIndex >= uint64(len(node.Log)) {
-		node.mutex.Unlock()
-		return
-	}
-	var prevLogTerm uint64
-	if nextIndex > 0 {
-		prevLogTerm = uint64(node.Log[nextIndex-1].Term)
+	var entries []LogEntry
+	if nextIndex < uint64(len(node.Log)) {
+		entries = []LogEntry{node.Log[nextIndex]}
 	}
 
 	appendEntry := &AppendEntriesMsg{
@@ -141,15 +120,13 @@ func (node *RaftNode) sendAppendEntriesToFollower(peer peer) {
 		IDofSender:   uint16(node.Id),
 		PrevLogIndex: nextIndex,
 		PrevLogTerm:  prevLogTerm,
-		Entries:      []LogEntry{node.Log[nextIndex]},
+		Entries:      entries,
 		LeaderCommit: node.CommitIndex,
 	}
 	node.mutex.Unlock()
 
-	message := &Message{MessageType(1), appendEntry, peer.Adress}
-	node.Transport.Send(peer.Adress, message)
+	node.Transport.Send(peer.Address, &Message{AppendEntries, appendEntry, peer.Address})
 }
-
 func (node *RaftNode) applyCommandToLeader(op operation, data any) (uint64, error) {
 	node.mutex.Lock()
 	if node.Role != Leader {
@@ -292,7 +269,7 @@ func (node *RaftNode) leaderHandleAppendEntriesResponse(msg *Message) {
 	var retryPeer peer
 	found := false
 	for _, p := range node.Peers {
-		if p.Adress == followerAddress {
+		if p.Address == followerAddress {
 			followerIndex = p.Id
 			retryPeer = p
 			found = true
@@ -436,7 +413,7 @@ func (node *RaftNode) leaderHandleJoin(msg *Message) {
 		}
 	}
 	if !known {
-		node.Peers = append(node.Peers, peer{Id: id, Adress: address})
+		node.Peers = append(node.Peers, peer{Id: id, Address: address})
 		node.NextIndex[id] = 0
 		node.MatchIndex[id] = 0
 	}

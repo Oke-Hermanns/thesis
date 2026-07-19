@@ -5,8 +5,8 @@ import (
 )
 
 type peer struct {
-	Id     uint8
-	Adress string
+	Id      uint8
+	Address string
 }
 type config struct {
 	// Time until a new heartbeat has to be send
