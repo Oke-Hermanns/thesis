@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 )
 
 type MessageType uint8
@@ -11,37 +12,42 @@ type MessageType uint8
 const (
 	AppendEntries MessageType = iota + 1
 	AppendEntriesResponse
+	Join
+	JoinResponse
 )
 
 type LogEntry struct {
-	Size    uint16
 	Term    uint32
 	Index   uint64
 	Payload []byte
 }
 
 type AppendEntriesMsg struct {
-	Term         uint32
-	LeaderID     uint16
-	PrevLogIndex uint64
-	PrevLogTerm  uint64
+	Term uint32
+	// This would normally be LeaderID, but because Followers use AppendEntriesMsg for joining the cluster, LeaderID did not make sense anymore
+	IDofSender   uint16
+	PrevLogIndex uint64 // Follower needs to check this (papers consistency check)
+	PrevLogTerm  uint64 // Follower needs to check this (papers consistency check)
 	Entries      []LogEntry
 	LeaderCommit uint64
 
 	// Fields send in the response message
 	Success     bool
-	CurrentTerm uint32 // TODO: Not sure if this is needed, but specified in the Raft paper
+	CurrentTerm uint32
+
+	SenderAddress string
 }
 
 type Message struct {
-	Type       MessageType
-	Body       *AppendEntriesMsg
-	RemoteAddr string
+	Type          MessageType
+	Body          *AppendEntriesMsg
+	RemoteAddress string
 }
 
 func encode(msgType MessageType, msg *AppendEntriesMsg) ([]byte, error) {
 	// 1 + 4 + 2 + 8 + 8 + 8 + 1 + 4 + 2 for message type, Term, LeaderID, PrevLogIndex, PrevLogTerm, LeaderCommit, Success, CurrentTerm, number of entries
-	bodySize := 1 + 4 + 2 + 8 + 8 + 8 + 1 + 4 + 2
+	// + 2 + len(SenderAddress) for the senders listening address (came later)
+	bodySize := 38 + 2 + len(msg.SenderAddress)
 
 	for entry := range msg.Entries {
 		bodySize += 2 + 4 + 8 + len(msg.Entries[entry].Payload)
@@ -55,7 +61,7 @@ func encode(msgType MessageType, msg *AppendEntriesMsg) ([]byte, error) {
 
 	binary.BigEndian.PutUint32(buffer[offset:], msg.Term)
 	offset += 4
-	binary.BigEndian.PutUint16(buffer[offset:], msg.LeaderID)
+	binary.BigEndian.PutUint16(buffer[offset:], msg.IDofSender)
 	offset += 2
 	binary.BigEndian.PutUint64(buffer[offset:], msg.PrevLogIndex)
 	offset += 8
@@ -75,6 +81,11 @@ func encode(msgType MessageType, msg *AppendEntriesMsg) ([]byte, error) {
 	offset += 4
 	binary.BigEndian.PutUint16(buffer[offset:], uint16(len(msg.Entries)))
 	offset += 2
+
+	binary.BigEndian.PutUint16(buffer[offset:], uint16(len(msg.SenderAddress)))
+	offset += 2
+	copy(buffer[offset:], msg.SenderAddress)
+	offset += len(msg.SenderAddress)
 
 	for entry := range msg.Entries {
 		binary.BigEndian.PutUint16(buffer[offset:], uint16(14+len(msg.Entries[entry].Payload)))
@@ -106,7 +117,7 @@ func decode(data []byte) (MessageType, *AppendEntriesMsg, error) {
 		return 0, nil, io.ErrUnexpectedEOF
 	}
 	data = data[4 : 4+messageSize]
-	if len(data) < 38 {
+	if len(data) < 40 {
 		return 0, nil, io.ErrUnexpectedEOF
 	}
 	message := &AppendEntriesMsg{}
@@ -121,7 +132,13 @@ func decode(data []byte) (MessageType, *AppendEntriesMsg, error) {
 	currentTerm := binary.BigEndian.Uint32(data[32:36])
 	numEntries := binary.BigEndian.Uint16(data[36:38])
 
-	entryOffset := 38
+	addressLen := int(binary.BigEndian.Uint16(data[38:40]))
+	if 40+addressLen > len(data) {
+		return 0, nil, io.ErrUnexpectedEOF
+	}
+	senderAddress := string(data[40 : 40+addressLen])
+
+	entryOffset := 40 + addressLen
 
 	for i := 0; i < int(numEntries); i++ {
 		if entryOffset+2 > len(data) {
@@ -140,7 +157,6 @@ func decode(data []byte) (MessageType, *AppendEntriesMsg, error) {
 		payloadSize := int(entrySize) - 14
 		payload := data[entryOffset+14 : entryOffset+14+payloadSize]
 		message.Entries = append(message.Entries, LogEntry{
-			Size:    entrySize,
 			Term:    entryTerm,
 			Index:   entryIndex,
 			Payload: payload,
@@ -150,14 +166,15 @@ func decode(data []byte) (MessageType, *AppendEntriesMsg, error) {
 	}
 
 	message = &AppendEntriesMsg{
-		Term:         term,
-		LeaderID:     leaderID,
-		PrevLogIndex: prevLogIndex,
-		Entries:      message.Entries,
-		PrevLogTerm:  prevLogTerm,
-		LeaderCommit: leaderCommit,
-		Success:      success == 1,
-		CurrentTerm:  currentTerm,
+		Term:          term,
+		IDofSender:    leaderID,
+		PrevLogIndex:  prevLogIndex,
+		Entries:       message.Entries,
+		PrevLogTerm:   prevLogTerm,
+		LeaderCommit:  leaderCommit,
+		Success:       success == 1,
+		CurrentTerm:   currentTerm,
+		SenderAddress: senderAddress,
 	}
 	return MessageType(msgType), message, nil
 }
@@ -165,12 +182,11 @@ func decode(data []byte) (MessageType, *AppendEntriesMsg, error) {
 type Transport interface {
 	Send(address string, msg *Message) error
 	Receive() <-chan *Message
+	getAddress() string
 	Close() error
 }
 
-// UDP
 // TODO: Sequence numbers might be worth a try, but for now unpacking and checking index and term should be fine, check later again when raft is working
-
 type UDPTransport struct {
 	localAddress string
 	recvCh       chan *Message
@@ -199,18 +215,23 @@ func setupUDPTransport(localAddress string, receiveBuffer int) (*UDPTransport, e
 	return transport, nil
 }
 
+func (transport *UDPTransport) getAddress() string {
+	return transport.localAddress
+}
+
 func (udpTransport *UDPTransport) Send(address string, msg *Message) error {
+	msg.Body.SenderAddress = udpTransport.localAddress
 	data, err := encode(msg.Type, msg.Body)
 	if err != nil {
 		return err
 	}
 
-	udpAddr, err := net.ResolveUDPAddr("udp", address)
+	udpAddress, err := net.ResolveUDPAddr("udp", address)
 	if err != nil {
 		return err
 	}
 
-	_, err = udpTransport.conn.WriteToUDP(data, udpAddr)
+	_, err = udpTransport.conn.WriteToUDP(data, udpAddress)
 	if err != nil {
 		return err
 	}
@@ -230,7 +251,7 @@ func (udpTransport *UDPTransport) busyReceiver() {
 	// Reminder to check in raft protocol that messages > 9000 bytes (-headers) are never sent
 	buffer := make([]byte, 9000)
 	for {
-		length, addr, err := udpTransport.conn.ReadFromUDP(buffer)
+		length, _, err := udpTransport.conn.ReadFromUDP(buffer)
 		if err != nil {
 			close(udpTransport.recvCh)
 			return
@@ -244,11 +265,173 @@ func (udpTransport *UDPTransport) busyReceiver() {
 		}
 
 		select {
-		case udpTransport.recvCh <- &Message{Type: msgType, Body: msg, RemoteAddr: addr.String()}:
+		case udpTransport.recvCh <- &Message{Type: msgType, Body: msg, RemoteAddress: msg.SenderAddress}:
 		default:
 			continue
 		}
 	}
 }
 
-// TODO: TCP communication
+type pooledConn struct {
+	conn  net.Conn
+	mutex sync.Mutex
+}
+
+type TCPTransport struct {
+	localAddress string
+	recvCh       chan *Message
+	listener     net.Listener
+
+	connsMutex sync.Mutex
+	conns      map[string]*pooledConn
+
+	acceptedMutex sync.Mutex
+	accepted      []net.Conn
+}
+
+func setupTCPTransport(localAddress string, receiveBuffer int) (*TCPTransport, error) {
+	listener, err := net.Listen("tcp", localAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	transport := &TCPTransport{
+		localAddress: localAddress,
+		recvCh:       make(chan *Message, receiveBuffer),
+		listener:     listener,
+		conns:        make(map[string]*pooledConn),
+	}
+	go transport.acceptLoop()
+
+	return transport, nil
+}
+
+func (transport *TCPTransport) getAddress() string {
+	return transport.localAddress
+}
+
+func (transport *TCPTransport) acceptLoop() {
+	for {
+		conn, err := transport.listener.Accept()
+		if err != nil {
+			return
+		}
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetNoDelay(true)
+		}
+		transport.acceptedMutex.Lock()
+		transport.accepted = append(transport.accepted, conn)
+		transport.acceptedMutex.Unlock()
+		go transport.readLoop(conn)
+	}
+}
+
+func (transport *TCPTransport) readLoop(conn net.Conn) {
+	for {
+		var lengthBuffer [4]byte
+		if _, err := io.ReadFull(conn, lengthBuffer[:]); err != nil {
+			return
+		}
+		length := binary.BigEndian.Uint32(lengthBuffer[:])
+		buf := make([]byte, 4+length)
+		copy(buf[0:4], lengthBuffer[:])
+		if _, err := io.ReadFull(conn, buf[4:]); err != nil {
+			return
+		}
+		msgType, msg, err := decode(buf)
+		if err != nil {
+			continue
+		}
+
+		select {
+		case transport.recvCh <- &Message{Type: msgType, Body: msg, RemoteAddress: msg.SenderAddress}:
+		default:
+		}
+	}
+}
+
+func (transport *TCPTransport) getConnection(address string) (*pooledConn, error) {
+	transport.connsMutex.Lock()
+	entry, ok := transport.conns[address]
+	transport.connsMutex.Unlock()
+	if ok {
+		return entry, nil
+	}
+
+	conn, err := net.Dial("tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+
+	newEntry := &pooledConn{conn: conn}
+
+	transport.connsMutex.Lock()
+	if existing, ok := transport.conns[address]; ok {
+		transport.connsMutex.Unlock()
+		conn.Close()
+		return existing, nil
+	}
+	transport.conns[address] = newEntry
+	transport.connsMutex.Unlock()
+
+	return newEntry, nil
+}
+
+func (transport *TCPTransport) dropConn(address string, entry *pooledConn) {
+	transport.connsMutex.Lock()
+	if transport.conns[address] == entry {
+		delete(transport.conns, address)
+	}
+	transport.connsMutex.Unlock()
+	entry.conn.Close()
+}
+
+func (transport *TCPTransport) Send(address string, msg *Message) error {
+	msg.Body.SenderAddress = transport.localAddress
+	data, err := encode(msg.Type, msg.Body)
+	if err != nil {
+		return err
+	}
+
+	entry, err := transport.getConnection(address)
+	if err != nil {
+		return err
+	}
+
+	entry.mutex.Lock()
+	_, err = entry.conn.Write(data)
+	entry.mutex.Unlock()
+
+	if err != nil {
+		transport.dropConn(address, entry)
+	}
+
+	return err
+}
+
+func (transport *TCPTransport) Receive() <-chan *Message {
+	return transport.recvCh
+}
+
+func (transport *TCPTransport) Close() error {
+	err := transport.listener.Close()
+
+	transport.connsMutex.Lock()
+	for _, entry := range transport.conns {
+		entry.conn.Close()
+	}
+	transport.conns = make(map[string]*pooledConn)
+	transport.connsMutex.Unlock()
+
+	transport.acceptedMutex.Lock()
+	for _, conn := range transport.accepted {
+		conn.Close()
+	}
+	transport.accepted = nil
+	transport.acceptedMutex.Unlock()
+
+	return err
+}
