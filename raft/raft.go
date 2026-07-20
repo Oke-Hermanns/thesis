@@ -67,6 +67,7 @@ func (node *RaftNode) makeLeader() {
 	node.CurrentTerm = 1
 
 	go node.heartbeatSender()
+	go node.commitTimeoutSender()
 	go node.receiveLoop()
 	go node.applyLoop()
 
@@ -89,6 +90,32 @@ func (node *RaftNode) heartbeatSender() {
 
 	for range ticker.C {
 		node.broadcast()
+	}
+}
+
+// Only works when config is adjusted for scenario
+func (node *RaftNode) commitTimeoutSender() {
+	ticker := time.NewTicker(node.Config.CommitTimeout)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		node.resendCommitTimeout()
+	}
+}
+
+func (node *RaftNode) resendCommitTimeout() {
+	node.mutex.Lock()
+	logLength := uint64(len(node.Log))
+	var lagging []peer
+	for _, p := range node.Peers {
+		if node.MatchIndex[p.Id] < logLength {
+			lagging = append(lagging, p)
+		}
+	}
+	node.mutex.Unlock()
+
+	for _, p := range lagging {
+		node.sendAppendEntriesToFollower(p)
 	}
 }
 
@@ -137,6 +164,7 @@ func (node *RaftNode) sendAppendEntriesToFollower(peer peer) {
 
 	node.Transport.Send(peer.Address, &Message{AppendEntries, appendEntry, peer.Address})
 }
+
 func (node *RaftNode) applyCommandToLeader(op operation, data any) (uint64, error) {
 	node.mutex.Lock()
 	if node.Role != Leader {
@@ -159,6 +187,8 @@ func (node *RaftNode) applyCommandToLeader(op operation, data any) (uint64, erro
 	}
 
 	node.Log = append(node.Log, entry)
+	// For a cluster with only one node, leaderHandleAppendEntriesResponse is never called
+	node.tryAdvanceCommitIndex(entry.Index)
 	peers := append([]peer(nil), node.Peers...)
 	node.mutex.Unlock()
 
@@ -168,10 +198,11 @@ func (node *RaftNode) applyCommandToLeader(op operation, data any) (uint64, erro
 	return entry.Index, nil
 }
 
-func (node *RaftNode) awaitCommit(index uint64) {
+// Block until index is applied to state machine, avoids get after put issues
+func (node *RaftNode) awaitAppliedToStateMachine(index uint64) {
 	node.mutex.Lock()
 	defer node.mutex.Unlock()
-	for node.CommitIndex < index {
+	for node.LastApplied < index {
 		node.newCommit.Wait()
 	}
 }
@@ -198,7 +229,7 @@ func (node *RaftNode) handleClientRequest(req *clientRequest) *clientResponse {
 		if err != nil {
 			return &clientResponse{Success: false, Error: err.Error()}
 		}
-		node.awaitCommit(index)
+		node.awaitAppliedToStateMachine(index)
 		return &clientResponse{Success: true}
 	case del:
 		value, found := node.stateMachine.Get(req.Key)
@@ -209,7 +240,7 @@ func (node *RaftNode) handleClientRequest(req *clientRequest) *clientResponse {
 		if err != nil {
 			return &clientResponse{Success: false, Error: err.Error()}
 		}
-		node.awaitCommit(index)
+		node.awaitAppliedToStateMachine(index)
 		return &clientResponse{Success: true, Value: value.([]byte)}
 	default:
 		return &clientResponse{Success: false, Error: "currently unsupported operation"}
@@ -226,15 +257,17 @@ func (node *RaftNode) followerHandleAppendEntries(msg *Message) {
 	node.mutex.Lock()
 
 	if appendEntry.Term < node.CurrentTerm {
+		logLength, nodeTerm := uint64(len(node.Log)), node.CurrentTerm
 		node.mutex.Unlock()
-		node.followerSendAppendEntriesResponse(false)
+		node.followerSendAppendEntriesResponse(false, logLength, nodeTerm)
 		return
 	}
 
 	if appendEntry.PrevLogIndex > uint64(len(node.Log)) ||
 		(appendEntry.PrevLogIndex > 0 && node.Log[appendEntry.PrevLogIndex-1].Term != uint32(appendEntry.PrevLogTerm)) {
+		logLength, nodeTerm := uint64(len(node.Log)), node.CurrentTerm
 		node.mutex.Unlock()
-		node.followerSendAppendEntriesResponse(false)
+		node.followerSendAppendEntriesResponse(false, logLength, nodeTerm)
 		return
 	}
 
@@ -256,9 +289,10 @@ func (node *RaftNode) followerHandleAppendEntries(msg *Message) {
 		node.CommitIndex = newCommitIndex
 		node.newCommit.Broadcast()
 	}
+	logLength, nodeTerm := uint64(len(node.Log)), node.CurrentTerm
 	node.mutex.Unlock()
 
-	node.followerSendAppendEntriesResponse(true)
+	node.followerSendAppendEntriesResponse(true, logLength, nodeTerm)
 }
 
 func (node *RaftNode) leaderHandleAppendEntriesResponse(msg *Message) {
@@ -300,19 +334,19 @@ func (node *RaftNode) leaderHandleAppendEntriesResponse(msg *Message) {
 		}
 		node.mutex.Unlock()
 	} else {
-		node.NextIndex[followerIndex] = node.NextIndex[followerIndex] - 1
+		node.NextIndex[followerIndex] = response.PrevLogIndex
 		node.mutex.Unlock()
 		node.sendAppendEntriesToFollower(retryPeer)
 	}
 }
 
-func (node *RaftNode) followerSendAppendEntriesResponse(success bool) {
+func (node *RaftNode) followerSendAppendEntriesResponse(success bool, logLength uint64, term uint32) {
 	resp := &Message{
 		Type: AppendEntriesResponse,
 		Body: &AppendEntriesMsg{
-			CurrentTerm:  node.CurrentTerm,
+			CurrentTerm:  term,
 			Success:      success,
-			PrevLogIndex: uint64(len(node.Log)),
+			PrevLogIndex: logLength,
 		},
 		RemoteAddress: node.Transport.getAddress(),
 	}
@@ -353,6 +387,7 @@ func (node *RaftNode) applyCommittedEntries() {
 			log.Printf("Failed to apply entry %d: %v", entry.Index, err)
 		}
 		node.mutex.Lock()
+		node.newCommit.Broadcast()
 	}
 }
 
@@ -416,9 +451,12 @@ func (node *RaftNode) leaderHandleJoin(msg *Message) {
 
 	node.mutex.Lock()
 	known := false
-	for _, p := range node.Peers {
+	for i, p := range node.Peers {
 		if p.Id == id {
 			known = true
+			if p.Address != address {
+				node.Peers[i].Address = address
+			}
 			break
 		}
 	}
