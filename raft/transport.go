@@ -53,8 +53,9 @@ func encode(msgType MessageType, msg *AppendEntriesMsg) ([]byte, error) {
 		bodySize += 2 + 4 + 8 + len(msg.Entries[entry].Payload)
 	}
 
-	buffer := make([]byte, bodySize)
-	offset := 0
+	buffer := make([]byte, 4+bodySize)
+	binary.BigEndian.PutUint32(buffer[0:4], uint32(bodySize))
+	offset := 4
 
 	buffer[offset] = byte(msgType)
 	offset += 1
@@ -98,14 +99,7 @@ func encode(msgType MessageType, msg *AppendEntriesMsg) ([]byte, error) {
 		offset += len(msg.Entries[entry].Payload)
 	}
 
-	// Add body length at the start
-	// TODO: This certainly can be done more efficiently
-	messageSize := len(buffer) + 4
-	bufferWithLength := make([]byte, messageSize)
-	binary.BigEndian.PutUint32(bufferWithLength[0:4], uint32(len(buffer)))
-	copy(bufferWithLength[4:], buffer)
-
-	return bufferWithLength, nil
+	return buffer, nil
 }
 
 func decode(data []byte) (MessageType, *AppendEntriesMsg, error) {
@@ -186,11 +180,14 @@ type Transport interface {
 	Close() error
 }
 
-// TODO: Sequence numbers might be worth a try, but for now unpacking and checking index and term should be fine, check later again when raft is working
+// UDP transport
 type UDPTransport struct {
 	localAddress string
 	recvCh       chan *Message
 	conn         *net.UDPConn
+
+	addrMutex sync.Mutex
+	addrCache map[string]*net.UDPAddr
 }
 
 func setupUDPTransport(localAddress string, receiveBuffer int) (*UDPTransport, error) {
@@ -208,6 +205,7 @@ func setupUDPTransport(localAddress string, receiveBuffer int) (*UDPTransport, e
 		localAddress: localAddress,
 		recvCh:       make(chan *Message, receiveBuffer),
 		conn:         conn,
+		addrCache:    make(map[string]*net.UDPAddr),
 	}
 
 	go transport.busyReceiver()
@@ -219,6 +217,26 @@ func (transport *UDPTransport) getAddress() string {
 	return transport.localAddress
 }
 
+func (udpTransport *UDPTransport) resolveCached(address string) (*net.UDPAddr, error) {
+	udpTransport.addrMutex.Lock()
+	cached, ok := udpTransport.addrCache[address]
+	udpTransport.addrMutex.Unlock()
+	if ok {
+		return cached, nil
+	}
+
+	resolved, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		return nil, err
+	}
+
+	udpTransport.addrMutex.Lock()
+	udpTransport.addrCache[address] = resolved
+	udpTransport.addrMutex.Unlock()
+
+	return resolved, nil
+}
+
 func (udpTransport *UDPTransport) Send(address string, msg *Message) error {
 	msg.Body.SenderAddress = udpTransport.localAddress
 	data, err := encode(msg.Type, msg.Body)
@@ -226,7 +244,7 @@ func (udpTransport *UDPTransport) Send(address string, msg *Message) error {
 		return err
 	}
 
-	udpAddress, err := net.ResolveUDPAddr("udp", address)
+	udpAddress, err := udpTransport.resolveCached(address)
 	if err != nil {
 		return err
 	}
@@ -272,6 +290,7 @@ func (udpTransport *UDPTransport) busyReceiver() {
 	}
 }
 
+// TCP transport
 type pooledConn struct {
 	conn  net.Conn
 	mutex sync.Mutex
@@ -343,10 +362,7 @@ func (transport *TCPTransport) readLoop(conn net.Conn) {
 			continue
 		}
 
-		select {
-		case transport.recvCh <- &Message{Type: msgType, Body: msg, RemoteAddress: msg.SenderAddress}:
-		default:
-		}
+		transport.recvCh <- &Message{Type: msgType, Body: msg, RemoteAddress: msg.SenderAddress}
 	}
 }
 
