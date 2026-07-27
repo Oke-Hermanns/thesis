@@ -35,7 +35,6 @@ func printUsage() {
 	fmt.Println("config flags (a -profile preset first, explicit flags override single values):")
 	fmt.Println("  -profile <name>       deployment scenario: " + strings.Join(profileNames(), ", ") + " (default datacenter)")
 	fmt.Println("  -heartbeat <dur>      override heartbeat interval, e.g. 200ms")
-	fmt.Println("  -commit-timeout <dur> override entry resend timeout")
 	fmt.Println("  -join-retry <dur>     override join retry interval")
 }
 
@@ -52,7 +51,6 @@ func parseConfig(flagArgs []string) config {
 	fs := flag.NewFlagSet("config", flag.ExitOnError)
 	profile := fs.String("profile", "datacenter", "deployment scenario: "+strings.Join(profileNames(), ", "))
 	heartbeat := fs.Duration("heartbeat", 0, "override heartbeat interval")
-	commitTimeout := fs.Duration("commit-timeout", 0, "override entry resend timeout")
 	joinRetry := fs.Duration("join-retry", 0, "override join retry interval")
 	fs.Parse(flagArgs)
 
@@ -66,15 +64,13 @@ func parseConfig(flagArgs []string) config {
 		switch f.Name {
 		case "heartbeat":
 			cfg.HeartbeatTimeout = *heartbeat
-		case "commit-timeout":
-			cfg.CommitTimeout = *commitTimeout
 		case "join-retry":
 			cfg.JoinRetryTimeout = *joinRetry
 		}
 	})
 
-	fmt.Printf("config: profile=%s heartbeat=%s commit-timeout=%s join-retry=%s\n",
-		*profile, cfg.HeartbeatTimeout, cfg.CommitTimeout, cfg.JoinRetryTimeout)
+	fmt.Printf("config: profile=%s heartbeat=%s join-retry=%s\n",
+		*profile, cfg.HeartbeatTimeout, cfg.JoinRetryTimeout)
 
 	return cfg
 }

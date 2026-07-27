@@ -43,9 +43,9 @@ func (kf *kvFsm) Apply(entry LogEntry) error {
 	kf.dbMutex.Lock()
 	defer kf.dbMutex.Unlock()
 	switch op {
-	case put:
+	case Put:
 		kf.db.Store(key, value)
-	case del:
+	case Del:
 		kf.db.Delete(key)
 	default:
 		return fmt.Errorf("Only put, delete and get are supported, %d does not exist currently", op)

@@ -16,9 +16,9 @@ const (
 )
 
 const (
-	put operation = iota + 1
-	get
-	del
+	Put operation = iota + 1
+	Get
+	Del
 )
 
 type RaftNode struct {
@@ -35,17 +35,17 @@ type RaftNode struct {
 	NextIndex   map[uint8]uint64
 	MatchIndex  map[uint8]uint64
 	Peers       []peer
-	replicators map[uint8]chan struct{}
+	Replicators map[uint8]chan struct{}
 	// For follower only
 	LeaderAddress string
 
-	mutex        sync.Mutex
-	newCommit    *sync.Cond
+	Mutex        sync.Mutex
+	NewCommit    *sync.Cond
 	stateMachine *kvFsm
 
 	// For follower only, closed when leader acknowledges join
-	joined   chan struct{}
-	joinOnce sync.Once
+	Joined   chan struct{}
+	JoinOnce sync.Once
 }
 
 func createNode(id uint8, transport Transport, config config, stateMachine *kvFsm) *RaftNode {
@@ -57,10 +57,10 @@ func createNode(id uint8, transport Transport, config config, stateMachine *kvFs
 		stateMachine: stateMachine,
 		NextIndex:    make(map[uint8]uint64),
 		MatchIndex:   make(map[uint8]uint64),
-		replicators:  make(map[uint8]chan struct{}),
-		joined:       make(chan struct{}),
+		Replicators:  make(map[uint8]chan struct{}),
+		Joined:       make(chan struct{}),
 	}
-	node.newCommit = sync.NewCond(&node.mutex)
+	node.NewCommit = sync.NewCond(&node.Mutex)
 	return node
 }
 
@@ -69,7 +69,6 @@ func (node *RaftNode) makeLeader() {
 	node.CurrentTerm = 1
 
 	go node.heartbeatSender()
-	go node.commitTimeoutSender()
 	go node.receiveLoop()
 	go node.applyLoop()
 
@@ -85,7 +84,7 @@ func (node *RaftNode) makeFollower(address string) {
 	go node.sendJoinToLeader()
 }
 
-// Currently only way to shutdown is to kill the node, add shutdown function later
+// Sends periodic heartbeats
 func (node *RaftNode) heartbeatSender() {
 	ticker := time.NewTicker(node.Config.HeartbeatTimeout)
 	defer ticker.Stop()
@@ -95,39 +94,14 @@ func (node *RaftNode) heartbeatSender() {
 	}
 }
 
-// Only works when config is adjusted for scenario
-func (node *RaftNode) commitTimeoutSender() {
-	ticker := time.NewTicker(node.Config.CommitTimeout)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		node.resendCommitTimeout()
-	}
-}
-
-func (node *RaftNode) resendCommitTimeout() {
-	node.mutex.Lock()
-	logLength := uint64(len(node.Log))
-	var lagging []uint8
-	for _, p := range node.Peers {
-		if node.MatchIndex[p.Id] < logLength {
-			lagging = append(lagging, p.Id)
-		}
-	}
-	node.mutex.Unlock()
-
-	for _, id := range lagging {
-		node.notifyReplicator(id)
-	}
-}
-
+// Initiates send to all followers (peers)
 func (node *RaftNode) broadcast() {
-	node.mutex.Lock()
+	node.Mutex.Lock()
 	ids := make([]uint8, len(node.Peers))
 	for i, p := range node.Peers {
 		ids[i] = p.Id
 	}
-	node.mutex.Unlock()
+	node.Mutex.Unlock()
 
 	for _, id := range ids {
 		node.notifyReplicator(id)
@@ -135,10 +109,11 @@ func (node *RaftNode) broadcast() {
 }
 
 // Replicator idea from hashicorp implementation
+// Called whenever the Leader needs to send something (Heartbeat/AppendEntries) to a Follower
 func (node *RaftNode) notifyReplicator(id uint8) {
-	node.mutex.Lock()
-	ch := node.replicators[id]
-	node.mutex.Unlock()
+	node.Mutex.Lock()
+	ch := node.Replicators[id]
+	node.Mutex.Unlock()
 	if ch == nil {
 		return
 	}
@@ -148,9 +123,10 @@ func (node *RaftNode) notifyReplicator(id uint8) {
 	}
 }
 
+// Started by the Leader when a Follower joins, handles replication to followers asynchronously
 func (node *RaftNode) startReplicator(id uint8) {
 	ch := make(chan struct{}, 1)
-	node.replicators[id] = ch
+	node.Replicators[id] = ch
 	go func() {
 		for range ch {
 			node.sendAppendEntriesToFollower(id)
@@ -158,10 +134,12 @@ func (node *RaftNode) startReplicator(id uint8) {
 	}()
 }
 
+// Sends to a specific follower, checks based on Raft paper conditions if entries have to be send
+// If no entries have to be send to the follower, the payload is empty, which is the definition of a heartbeat message
 func (node *RaftNode) sendAppendEntriesToFollower(id uint8) {
 	// 8000 should work for all cloud environments with jumbo frames enabled
 	const maxEntriesBytes = 8000
-	node.mutex.Lock()
+	node.Mutex.Lock()
 	address := ""
 	for _, p := range node.Peers {
 		if p.Id == id {
@@ -170,7 +148,7 @@ func (node *RaftNode) sendAppendEntriesToFollower(id uint8) {
 		}
 	}
 	if address == "" {
-		node.mutex.Unlock()
+		node.Mutex.Unlock()
 		return
 	}
 	nextIndex := node.NextIndex[id]
@@ -198,86 +176,42 @@ func (node *RaftNode) sendAppendEntriesToFollower(id uint8) {
 		Entries:      entries,
 		LeaderCommit: node.CommitIndex,
 	}
-	node.mutex.Unlock()
+	node.Mutex.Unlock()
 
 	node.Transport.Send(address, &Message{AppendEntries, appendEntry, address})
 }
 
-func (node *RaftNode) applyCommandToLeader(op operation, data any) (uint64, error) {
-	node.mutex.Lock()
-	if node.Role != Leader {
-		node.mutex.Unlock()
-		return 0, fmt.Errorf("not leader")
-	}
-	if op != put && op != del {
-		node.mutex.Unlock()
-		return 0, fmt.Errorf("invalid operation")
-	}
-	transformedData, ok := data.([]byte)
-	if !ok {
-		node.mutex.Unlock()
-		return 0, fmt.Errorf("failed to transform data to bytes")
-	}
-	entry := LogEntry{
-		Term:    node.CurrentTerm,
-		Index:   uint64(len(node.Log) + 1),
-		Payload: transformedData,
-	}
-
-	node.Log = append(node.Log, entry)
-	// For a cluster with only one node, leaderHandleAppendEntriesResponse is never called
-	node.tryAdvanceCommitIndex(entry.Index)
-	ids := make([]uint8, len(node.Peers))
-	for i, p := range node.Peers {
-		ids[i] = p.Id
-	}
-	node.mutex.Unlock()
-
-	for _, id := range ids {
-		node.notifyReplicator(id)
-	}
-	return entry.Index, nil
-}
-
-// Block until index is applied to state machine, avoids get after put issues
-func (node *RaftNode) awaitAppliedToStateMachine(index uint64) {
-	node.mutex.Lock()
-	defer node.mutex.Unlock()
-	for node.LastApplied < index {
-		node.newCommit.Wait()
-	}
-}
-
+// Check if request is valid and if that is the case, apply the command to the leader
 func (node *RaftNode) handleClientRequest(req *clientRequest) *clientResponse {
-	node.mutex.Lock()
+	node.Mutex.Lock()
 	isLeader := node.Role == Leader
 	leaderHint := node.LeaderAddress
-	node.mutex.Unlock()
+	node.Mutex.Unlock()
 
 	if !isLeader {
 		return &clientResponse{Success: false, LeaderHint: leaderHint, Error: "not leader"}
 	}
 
 	switch req.Op {
-	case get:
+	case Get:
 		value, found := node.stateMachine.Get(req.Key)
 		if !found {
 			return &clientResponse{Success: false, Error: "key not found"}
 		}
 		return &clientResponse{Success: true, Value: value.([]byte)}
-	case put:
-		index, err := node.applyCommandToLeader(put, encodeCommand(put, req.Key, req.Value))
+	case Put:
+		index, err := node.applyCommandToLeader(Put, encodeCommand(Put, req.Key, req.Value))
 		if err != nil {
 			return &clientResponse{Success: false, Error: err.Error()}
 		}
 		node.awaitAppliedToStateMachine(index)
 		return &clientResponse{Success: true}
-	case del:
+	case Del:
 		value, found := node.stateMachine.Get(req.Key)
 		if !found {
 			return &clientResponse{Success: false, Error: "key not found"}
 		}
-		index, err := node.applyCommandToLeader(del, encodeCommand(del, req.Key, nil))
+		index, err := node.applyCommandToLeader(Del, encodeCommand(Del, req.Key, nil))
 		if err != nil {
 			return &clientResponse{Success: false, Error: err.Error()}
 		}
@@ -288,6 +222,57 @@ func (node *RaftNode) handleClientRequest(req *clientRequest) *clientResponse {
 	}
 }
 
+// Append the command to the leaders log and start the replication process
+func (node *RaftNode) applyCommandToLeader(op operation, data any) (uint64, error) {
+	node.Mutex.Lock()
+	if node.Role != Leader {
+		node.Mutex.Unlock()
+		return 0, fmt.Errorf("not leader")
+	}
+	if op != Put && op != Del {
+		node.Mutex.Unlock()
+		return 0, fmt.Errorf("invalid operation")
+	}
+	transformedData, ok := data.([]byte)
+	if !ok {
+		node.Mutex.Unlock()
+		return 0, fmt.Errorf("failed to transform data to bytes")
+	}
+	entry := LogEntry{
+		Term:    node.CurrentTerm,
+		Index:   uint64(len(node.Log) + 1),
+		Payload: transformedData,
+	}
+
+	node.Log = append(node.Log, entry)
+	// For a cluster with only one node, leaderHandleAppendEntriesResponse is never called
+	if len(node.Peers) == 0 {
+		node.tryAdvanceCommitIndex(entry.Index)
+		node.Mutex.Unlock()
+	} else {
+		ids := make([]uint8, len(node.Peers))
+		for i, p := range node.Peers {
+			ids[i] = p.Id
+		}
+		node.Mutex.Unlock()
+
+		for _, id := range ids {
+			node.notifyReplicator(id)
+		}
+	}
+	return entry.Index, nil
+}
+
+// Block until index is applied to state machine, avoids get after put issues
+func (node *RaftNode) awaitAppliedToStateMachine(index uint64) {
+	node.Mutex.Lock()
+	defer node.Mutex.Unlock()
+	for node.LastApplied < index {
+		node.NewCommit.Wait()
+	}
+}
+
+// Append Entries to Follower if term and previous log index allow it
 func (node *RaftNode) followerHandleAppendEntries(msg *Message) {
 	if msg.Type != AppendEntries {
 		log.Println("A follower can only handle AppendEntries, no AppendEntriesResponse")
@@ -295,11 +280,12 @@ func (node *RaftNode) followerHandleAppendEntries(msg *Message) {
 	}
 	appendEntry := msg.Body
 
-	node.mutex.Lock()
+	node.Mutex.Lock()
 
+	// There is no leader election, so the term will never change, but treated as if it was possible
 	if appendEntry.Term < node.CurrentTerm {
 		logLength, nodeTerm := uint64(len(node.Log)), node.CurrentTerm
-		node.mutex.Unlock()
+		node.Mutex.Unlock()
 		node.followerSendAppendEntriesResponse(false, logLength, nodeTerm)
 		return
 	}
@@ -307,7 +293,7 @@ func (node *RaftNode) followerHandleAppendEntries(msg *Message) {
 	if appendEntry.PrevLogIndex > uint64(len(node.Log)) ||
 		(appendEntry.PrevLogIndex > 0 && node.Log[appendEntry.PrevLogIndex-1].Term != uint32(appendEntry.PrevLogTerm)) {
 		logLength, nodeTerm := uint64(len(node.Log)), node.CurrentTerm
-		node.mutex.Unlock()
+		node.Mutex.Unlock()
 		node.followerSendAppendEntriesResponse(false, logLength, nodeTerm)
 		return
 	}
@@ -328,14 +314,17 @@ func (node *RaftNode) followerHandleAppendEntries(msg *Message) {
 			newCommitIndex = logLen
 		}
 		node.CommitIndex = newCommitIndex
-		node.newCommit.Broadcast()
+		node.NewCommit.Broadcast()
 	}
 	logLength, nodeTerm := uint64(len(node.Log)), node.CurrentTerm
-	node.mutex.Unlock()
+	node.Mutex.Unlock()
 
 	node.followerSendAppendEntriesResponse(true, logLength, nodeTerm)
 }
 
+// Initiates new send by notifying replicator if msg is unsuccessful appendentries
+// Does nothing for a heartbeat response
+// Trys to advance commit indiex for successful append
 func (node *RaftNode) leaderHandleAppendEntriesResponse(msg *Message) {
 	if node.Role != Leader {
 		log.Println("Follower is not allowed to call leaderHandleAppendEntriesResponse")
@@ -348,7 +337,7 @@ func (node *RaftNode) leaderHandleAppendEntriesResponse(msg *Message) {
 	response := msg.Body
 	followerAddress := msg.RemoteAddress
 
-	node.mutex.Lock()
+	node.Mutex.Lock()
 	var followerIndex uint8
 	found := false
 	for _, p := range node.Peers {
@@ -359,7 +348,8 @@ func (node *RaftNode) leaderHandleAppendEntriesResponse(msg *Message) {
 		}
 	}
 	if !found {
-		node.mutex.Unlock()
+		node.Mutex.Unlock()
+		log.Printf("The node with address %s is currently not known", followerAddress)
 		return
 	}
 	if response.Success {
@@ -369,14 +359,15 @@ func (node *RaftNode) leaderHandleAppendEntriesResponse(msg *Message) {
 			node.NextIndex[followerIndex] = matchIndex
 			node.tryAdvanceCommitIndex(matchIndex)
 		}
-		node.mutex.Unlock()
+		node.Mutex.Unlock()
 	} else {
 		node.NextIndex[followerIndex] = response.PrevLogIndex
-		node.mutex.Unlock()
+		node.Mutex.Unlock()
 		node.notifyReplicator(followerIndex)
 	}
 }
 
+// Notify leader about status of AppendEntries request
 func (node *RaftNode) followerSendAppendEntriesResponse(success bool, logLength uint64, term uint32) {
 	resp := &Message{
 		Type: AppendEntriesResponse,
@@ -391,6 +382,7 @@ func (node *RaftNode) followerSendAppendEntriesResponse(success bool, logLength 
 	node.Transport.Send(node.LeaderAddress, resp)
 }
 
+// Advances the commit index if more than half of the nodes have a higher index in their log
 func (node *RaftNode) tryAdvanceCommitIndex(indexToTry uint64) {
 	if logLen := uint64(len(node.Log)); indexToTry > logLen {
 		indexToTry = logLen
@@ -408,26 +400,28 @@ func (node *RaftNode) tryAdvanceCommitIndex(indexToTry uint64) {
 
 	if count+1 >= quorum && indexToTry > node.CommitIndex {
 		node.CommitIndex = indexToTry
-		node.newCommit.Broadcast()
+		node.NewCommit.Broadcast()
 	}
 }
 
+// Applies entries to the key value state machine (kvFsm)
 func (node *RaftNode) applyCommittedEntries() {
-	node.mutex.Lock()
-	defer node.mutex.Unlock()
+	node.Mutex.Lock()
+	defer node.Mutex.Unlock()
 	for node.LastApplied < node.CommitIndex {
-		node.LastApplied++
-		entry := node.Log[node.LastApplied-1]
-		node.mutex.Unlock()
+		entry := node.Log[node.LastApplied]
+		node.Mutex.Unlock()
 		err := node.stateMachine.Apply(entry)
 		if err != nil {
-			log.Printf("Failed to apply entry %d: %v", entry.Index, err)
+			log.Panicf("Failed to apply entry %d: %v", entry.Index, err)
 		}
-		node.mutex.Lock()
-		node.newCommit.Broadcast()
+		node.Mutex.Lock()
+		node.LastApplied++
+		node.NewCommit.Broadcast()
 	}
 }
 
+// Calls the correct function based on the message type received
 func (node *RaftNode) receiveLoop() {
 	// Runs as long as channel is open
 	for msg := range node.Transport.Receive() {
@@ -446,18 +440,22 @@ func (node *RaftNode) receiveLoop() {
 	}
 }
 
+// Gets waken up when the commit index advances
 func (node *RaftNode) applyLoop() {
 	for {
-		node.mutex.Lock()
+		node.Mutex.Lock()
 		for node.LastApplied >= node.CommitIndex {
-			node.newCommit.Wait()
+			node.NewCommit.Wait()
 		}
-		node.mutex.Unlock()
+		node.Mutex.Unlock()
 		node.applyCommittedEntries()
 	}
 }
 
-// Functions to connect nodes in cluster
+/*
+All functions below are not a part of the Raft algorithm, only a simple way to connect nodes to the leader
+*/
+
 func (node *RaftNode) sendJoinToLeader() {
 	ticker := time.NewTicker(node.Config.JoinRetryTimeout)
 	defer ticker.Stop()
@@ -467,7 +465,7 @@ func (node *RaftNode) sendJoinToLeader() {
 		select {
 		case <-ticker.C:
 			node.sendJoin()
-		case <-node.joined:
+		case <-node.Joined:
 			return
 		}
 	}
@@ -486,7 +484,7 @@ func (node *RaftNode) leaderHandleJoin(msg *Message) {
 	id := uint8(msg.Body.IDofSender)
 	address := msg.RemoteAddress
 
-	node.mutex.Lock()
+	node.Mutex.Lock()
 	known := false
 	for i, p := range node.Peers {
 		if p.Id == id {
@@ -503,7 +501,7 @@ func (node *RaftNode) leaderHandleJoin(msg *Message) {
 		node.MatchIndex[id] = 0
 		node.startReplicator(id)
 	}
-	node.mutex.Unlock()
+	node.Mutex.Unlock()
 
 	node.leaderSendJoinResponse(address)
 }
@@ -518,5 +516,5 @@ func (node *RaftNode) leaderSendJoinResponse(followerAddress string) {
 }
 
 func (node *RaftNode) followerHandleJoinResponse() {
-	node.joinOnce.Do(func() { close(node.joined) })
+	node.JoinOnce.Do(func() { close(node.Joined) })
 }
