@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# Gets or deletes a single key from a raft leader's client-facing TCP port,
-# using the binary protocol defined in client.go
-# (encodeClientRequest/decodeClientResponse). See send_puts.sh for why this
-# is a Python helper instead of plain bash/HTTP.
+# sends exactly one put, get, or delete
+# Not a benchmark -- for manual testing/debugging
 #
-# Usage: ./send_get_delete.sh <leader-client-addr:port> <get|delete> <key>
+# Usage: ./send_request.sh <leader-client-addr:port> put <key> <value>
+#        ./send_request.sh <leader-client-addr:port> get <key>
+#        ./send_request.sh <leader-client-addr:port> delete <key>
 #   leader-client-addr:port  e.g. 128.110.219.132:9001
 #   key                      a bare number (e.g. 17 -> "key17", matching the
-#                            keys send_puts.sh writes) or an arbitrary string
+#                            keys the bench_*/send_puts scripts write) or an
+#                            arbitrary string
 
 set -euo pipefail
 
-if [ $# -ne 3 ]; then
-    echo "usage: $0 <leader-client-addr:port> <get|delete> <key>" >&2
+if [ $# -lt 3 ]; then
+    echo "usage:" >&2
+    echo "  $0 <leader-client-addr:port> put <key> <value>" >&2
+    echo "  $0 <leader-client-addr:port> get <key>" >&2
+    echo "  $0 <leader-client-addr:port> delete <key>" >&2
     exit 1
 fi
 
@@ -21,11 +25,18 @@ HOST="${ADDR%:*}"
 PORT="${ADDR##*:}"
 OP="$2"
 KEY="$3"
+VALUE="${4:-}"
 
 case "$OP" in
+    put)
+        if [ $# -ne 4 ]; then
+            echo "usage: $0 <leader-client-addr:port> put <key> <value>" >&2
+            exit 1
+        fi
+        ;;
     get|delete) ;;
     *)
-        echo "operation must be 'get' or 'delete', got: $OP" >&2
+        echo "operation must be 'put', 'get' or 'delete', got: $OP" >&2
         exit 1
         ;;
 esac
@@ -34,15 +45,21 @@ if [[ "$KEY" =~ ^[0-9]+$ ]]; then
     KEY="key${KEY}"
 fi
 
-python3 - "$HOST" "$PORT" "$OP" "$KEY" <<'PYEOF'
+python3 - "$HOST" "$PORT" "$OP" "$KEY" "$VALUE" <<'PYEOF'
 import socket
 import struct
 import sys
 
-host, port, op_name, key = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4].encode()
+host, port, op_name, key, value = (
+    sys.argv[1],
+    int(sys.argv[2]),
+    sys.argv[3],
+    sys.argv[4].encode(),
+    sys.argv[5].encode(),
+)
 
-# Must match `const ( put operation = iota + 1; get; del )` in raft.go
-OP = {"get": 2, "delete": 3}[op_name]
+# Must match `const ( Put operation = iota + 1; Get; Del )` in raft.go
+OP = {"put": 1, "get": 2, "delete": 3}[op_name]
 
 
 def read_exact(sock, n):
@@ -55,9 +72,9 @@ def read_exact(sock, n):
     return buf
 
 
-def encode_request(key: bytes) -> bytes:
-    # get/delete requests carry no value.
-    body = struct.pack(">B H", OP, len(key)) + key + struct.pack(">I", 0)
+def encode_request(key: bytes, value: bytes) -> bytes:
+    # get/delete carry no value, put does.
+    body = struct.pack(">B H", OP, len(key)) + key + struct.pack(">I", len(value)) + value
     return struct.pack(">I", len(body)) + body
 
 
@@ -81,7 +98,7 @@ def decode_response(body: bytes):
 try:
     sock = socket.create_connection((host, port), timeout=5)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.sendall(encode_request(key))
+    sock.sendall(encode_request(key, value if op_name == "put" else b""))
     (resp_len,) = struct.unpack(">I", read_exact(sock, 4))
     resp_body = read_exact(sock, resp_len)
     sock.close()
@@ -89,13 +106,15 @@ except (OSError, EOFError) as e:
     print(f"error: no response from {host}:{port} ({e})", file=sys.stderr)
     sys.exit(1)
 
-success, leader_hint, error, value = decode_response(resp_body)
+success, leader_hint, error, resp_value = decode_response(resp_body)
 
 if success:
     if op_name == "get":
-        print(value.decode(errors="replace"))
+        print(resp_value.decode(errors="replace"))
+    elif op_name == "put":
+        print(f"put {key.decode()}={value.decode()}")
     else:
-        print(f"deleted {key.decode()}, previous value: {value.decode(errors='replace')!r}")
+        print(f"deleted {key.decode()}, previous value: {resp_value.decode(errors='replace')!r}")
 else:
     if error == "key not found":
         print(f"{key.decode()}: not found", file=sys.stderr)

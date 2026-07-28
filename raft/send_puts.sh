@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Sends N put requests to a raft leader's client-facing TCP port, using the
-# binary protocol defined in client.go (encodeClientRequest/decodeClientResponse).
-# Not plain HTTP/text, so the actual framing/parsing is done by an embedded
-# Python3 helper (bash can't reliably handle binary data - NUL bytes truncate
-# bash string variables) over a single persistent connection, matching how the
-# leader expects a benchmarking client to behave.
+# Sends put requests to a raft leader's client-facing TCP port for a fixed
+# duration, using the binary protocol defined in client.go
+# (encodeClientRequest/decodeClientResponse). Not plain HTTP/text, so the
+# actual framing/parsing is done by an embedded Python3 helper (bash can't
+# reliably handle binary data - NUL bytes truncate bash string variables)
+# over a single persistent connection, matching how the leader expects a
+# benchmarking client to behave.
 #
-# Usage: ./send_puts.sh <leader-client-addr:port> [count] [value-size] [timeout-seconds] [-d|--duration seconds]
+# Usage: ./send_puts.sh <leader-client-addr:port> <duration-seconds> [value-size] [timeout-seconds]
 #   leader-client-addr:port  e.g. 128.110.219.132:9001
-#   count                    number of puts to send (default 100). Ignored
-#                            if -d/--duration is given.
+#   duration-seconds         how long to run, sending puts back to back
 #   value-size               bytes per value (default 8, value is "x" repeated)
 #   timeout-seconds          per-request response timeout (default 2). A put
 #                            can legitimately never get a response - e.g. the
@@ -17,64 +17,37 @@
 #                            AppendEntries/response that would let it commit
 #                            got dropped - so this bounds how long we wait
 #                            before giving up on a request and reconnecting.
-#   -d, --duration seconds   run for this many seconds instead of a fixed
-#                            count, sending puts back to back until time is up.
 
 set -euo pipefail
 
-DURATION=0
-ARGS=()
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -d|--duration)
-            DURATION="$2"
-            shift 2
-            ;;
-        --duration=*)
-            DURATION="${1#*=}"
-            shift
-            ;;
-        *)
-            ARGS+=("$1")
-            shift
-            ;;
-    esac
-done
-if [ ${#ARGS[@]} -gt 0 ]; then
-    set -- "${ARGS[@]}"
-else
-    set --
-fi
-
-if [ $# -lt 1 ]; then
-    echo "usage: $0 <leader-client-addr:port> [count] [value-size] [timeout-seconds] [-d|--duration seconds]" >&2
+if [ $# -lt 2 ]; then
+    echo "usage: $0 <leader-client-addr:port> <duration-seconds> [value-size] [timeout-seconds]" >&2
     exit 1
 fi
 
 ADDR="$1"
 HOST="${ADDR%:*}"
 PORT="${ADDR##*:}"
-COUNT="${2:-100}"
+DURATION="$2"
 VALUE_SIZE="${3:-8}"
 TIMEOUT="${4:-2}"
 
-python3 - "$HOST" "$PORT" "$COUNT" "$VALUE_SIZE" "$TIMEOUT" "$DURATION" <<'PYEOF'
+python3 - "$HOST" "$PORT" "$VALUE_SIZE" "$TIMEOUT" "$DURATION" <<'PYEOF'
 import socket
 import statistics
 import struct
 import sys
 import time
 
-host, port, count, value_size, timeout, duration = (
+host, port, value_size, timeout, duration = (
     sys.argv[1],
     int(sys.argv[2]),
     int(sys.argv[3]),
-    int(sys.argv[4]),
+    float(sys.argv[4]),
     float(sys.argv[5]),
-    float(sys.argv[6]),
 )
 
-PUT = 1  # matches `const put operation = iota + 1` in raft.go
+PUT = 1  # matches `const Put operation = iota + 1` in raft.go
 
 
 def read_exact(sock, n):
@@ -123,20 +96,10 @@ fail = 0
 lost = 0
 latencies = []
 
-if duration > 0:
-    print(f"running for {duration:.0f}s...", file=sys.stderr)
-else:
-    print(f"sending {count} puts...", file=sys.stderr)
-
 bench_start = time.monotonic()
 
 i = 0
-while True:
-    if duration > 0:
-        if time.monotonic() - bench_start >= duration:
-            break
-    elif i >= count:
-        break
+while time.monotonic() - bench_start < duration:
     i += 1
 
     key = f"key{i}".encode()
@@ -154,11 +117,9 @@ while True:
         if success:
             ok += 1
             latencies.append(elapsed)
-            print(f"request {i}: put {key.decode()}={value.decode()} committed in {elapsed*1e6:.1f}us")
         else:
             fail += 1
-            print(f"request {i}: failed: {error} (leader hint: {leader_hint})", file=sys.stderr)
-    except (OSError, EOFError) as e:
+    except (OSError, EOFError):
         # No response within `timeout`, or the connection dropped mid-request.
         # Common cause: the cluster's raft transport is UDP and a message
         # needed to commit this entry was lost, so the leader never replies.
@@ -167,12 +128,10 @@ while True:
         # and reconnect before sending the next request.
         fail += 1
         lost += 1
-        print(f"request {i}: no response within {timeout}s ({e}); reconnecting", file=sys.stderr)
         sock.close()
         try:
             sock = connect()
-        except OSError as reconnect_err:
-            print(f"reconnect to {host}:{port} failed ({reconnect_err}); giving up", file=sys.stderr)
+        except OSError:
             break
 
 bench_elapsed = time.monotonic() - bench_start

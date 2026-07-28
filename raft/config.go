@@ -23,15 +23,15 @@ type config struct {
 // TODO: Might not be perfectly adjusted yet
 var configProfiles = map[string]config{
 	"close": {
-		HeartbeatTimeout: 100 * time.Millisecond,
+		HeartbeatTimeout: 10 * time.Millisecond,
 		JoinRetryTimeout: 200 * time.Millisecond,
 	},
 	"datacenter": {
-		HeartbeatTimeout: 200 * time.Millisecond,
+		HeartbeatTimeout: 25 * time.Millisecond,
 		JoinRetryTimeout: 500 * time.Millisecond,
 	},
 	"zone": {
-		HeartbeatTimeout: 300 * time.Millisecond,
+		HeartbeatTimeout: 100 * time.Millisecond,
 		JoinRetryTimeout: 500 * time.Millisecond,
 	},
 	"region": {
