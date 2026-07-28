@@ -20,7 +20,7 @@ type config struct {
 //	zone        different zones, same region
 //	region      different regions
 //
-// TODO: Might not be perfectly adjusted yet
+// TODO: The Heartbeat timeouts have to be adjusted before aws/gcp testing!
 var configProfiles = map[string]config{
 	"close": {
 		HeartbeatTimeout: 10 * time.Millisecond,
