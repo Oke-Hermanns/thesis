@@ -1,0 +1,1 @@
+Simple go script to mimic sockperf latency measurments.
