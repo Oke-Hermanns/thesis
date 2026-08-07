@@ -36,6 +36,11 @@ type AppendEntriesMsg struct {
 	CurrentTerm uint32
 
 	SenderAddress string
+
+	Sequence       uint64
+	LinkReceived   uint64
+	LinkLost       uint64
+	LinkOutOfOrder uint64
 }
 
 type Message struct {
@@ -44,10 +49,93 @@ type Message struct {
 	RemoteAddress string
 }
 
+type LinkStats struct {
+	Received   uint64
+	Lost       uint64
+	OutOfOrder uint64
+}
+
+type linkSendSeq struct {
+	mutex sync.Mutex
+	seq   map[string]uint64
+}
+
+func newLinkSendSeq() *linkSendSeq {
+	return &linkSendSeq{seq: make(map[string]uint64)}
+}
+
+func (s *linkSendSeq) next(address string) uint64 {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.seq[address]++
+	return s.seq[address]
+}
+
+type linkRecvTracker struct {
+	mutex sync.Mutex
+	stats map[string]*linkRecvState
+}
+
+type linkRecvState struct {
+	lastSeq    uint64
+	received   uint64
+	lost       uint64
+	outOfOrder uint64
+}
+
+func newLinkRecvTracker() *linkRecvTracker {
+	return &linkRecvTracker{stats: make(map[string]*linkRecvState)}
+}
+
+/*
+If a packet arrives out of order, it gets deducted from the lost count.
+However, there is a risk of counting duplicates, e.g. through Equal-Cost Multi-Path routing.
+But keeping track of recently seen sequence numbers or counting out of order arrivals as lost aren't perfect either.
+*/
+func (tracker *linkRecvTracker) record(address string, seq uint64) {
+	tracker.mutex.Lock()
+	defer tracker.mutex.Unlock()
+
+	state, ok := tracker.stats[address]
+	if !ok {
+		state = &linkRecvState{}
+		tracker.stats[address] = state
+	}
+	if ok {
+		if seq > state.lastSeq+1 {
+			state.lost += seq - state.lastSeq - 1
+		}
+		if seq <= state.lastSeq {
+			// High number of out of order packets and zero loss indicates duplicate packets
+			state.outOfOrder++
+			if state.lost > 0 {
+				state.lost--
+			}
+		}
+		if seq > state.lastSeq {
+			state.lastSeq = seq
+		}
+	} else {
+		state.lastSeq = seq
+	}
+	state.received++
+}
+
+func (tracker *linkRecvTracker) snapshot() map[string]LinkStats {
+	tracker.mutex.Lock()
+	defer tracker.mutex.Unlock()
+
+	out := make(map[string]LinkStats, len(tracker.stats))
+	for addr, s := range tracker.stats {
+		out[addr] = LinkStats{Received: s.received, Lost: s.lost, OutOfOrder: s.outOfOrder}
+	}
+	return out
+}
+
 func encode(msgType MessageType, msg *AppendEntriesMsg) ([]byte, error) {
-	// 1 + 4 + 2 + 8 + 8 + 8 + 1 + 4 + 2 for message type, Term, LeaderID, PrevLogIndex, PrevLogTerm, LeaderCommit, Success, CurrentTerm, number of entries
+	// 1 + 8 + 4 + 2 + 8 + 8 + 8 + 1 + 4 + 8 + 8 + 8 + 2 for message type, Sequence, Term, LeaderID, PrevLogIndex, PrevLogTerm, LeaderCommit, Success, CurrentTerm, LinkReceived, LinkLost, LinkOutOfOrder, number of entries
 	// + 2 + len(SenderAddress) for the senders listening address (came later)
-	bodySize := 38 + 2 + len(msg.SenderAddress)
+	bodySize := 70 + 2 + len(msg.SenderAddress)
 
 	for entry := range msg.Entries {
 		bodySize += 2 + 4 + 8 + len(msg.Entries[entry].Payload)
@@ -60,6 +148,8 @@ func encode(msgType MessageType, msg *AppendEntriesMsg) ([]byte, error) {
 	buffer[offset] = byte(msgType)
 	offset += 1
 
+	binary.BigEndian.PutUint64(buffer[offset:], msg.Sequence)
+	offset += 8
 	binary.BigEndian.PutUint32(buffer[offset:], msg.Term)
 	offset += 4
 	binary.BigEndian.PutUint16(buffer[offset:], msg.IDofSender)
@@ -80,6 +170,12 @@ func encode(msgType MessageType, msg *AppendEntriesMsg) ([]byte, error) {
 
 	binary.BigEndian.PutUint32(buffer[offset:], msg.CurrentTerm)
 	offset += 4
+	binary.BigEndian.PutUint64(buffer[offset:], msg.LinkReceived)
+	offset += 8
+	binary.BigEndian.PutUint64(buffer[offset:], msg.LinkLost)
+	offset += 8
+	binary.BigEndian.PutUint64(buffer[offset:], msg.LinkOutOfOrder)
+	offset += 8
 	binary.BigEndian.PutUint16(buffer[offset:], uint16(len(msg.Entries)))
 	offset += 2
 
@@ -111,28 +207,32 @@ func decode(data []byte) (MessageType, *AppendEntriesMsg, error) {
 		return 0, nil, io.ErrUnexpectedEOF
 	}
 	data = data[4 : 4+messageSize]
-	if len(data) < 40 {
+	if len(data) < 72 {
 		return 0, nil, io.ErrUnexpectedEOF
 	}
 	message := &AppendEntriesMsg{}
 
 	msgType := MessageType(data[0])
-	term := binary.BigEndian.Uint32(data[1:5])
-	leaderID := binary.BigEndian.Uint16(data[5:7])
-	prevLogIndex := binary.BigEndian.Uint64(data[7:15])
-	prevLogTerm := binary.BigEndian.Uint64(data[15:23])
-	leaderCommit := binary.BigEndian.Uint64(data[23:31])
-	success := data[31]
-	currentTerm := binary.BigEndian.Uint32(data[32:36])
-	numEntries := binary.BigEndian.Uint16(data[36:38])
+	sequence := binary.BigEndian.Uint64(data[1:9])
+	term := binary.BigEndian.Uint32(data[9:13])
+	leaderID := binary.BigEndian.Uint16(data[13:15])
+	prevLogIndex := binary.BigEndian.Uint64(data[15:23])
+	prevLogTerm := binary.BigEndian.Uint64(data[23:31])
+	leaderCommit := binary.BigEndian.Uint64(data[31:39])
+	success := data[39]
+	currentTerm := binary.BigEndian.Uint32(data[40:44])
+	linkReceived := binary.BigEndian.Uint64(data[44:52])
+	linkLost := binary.BigEndian.Uint64(data[52:60])
+	linkOutOfOrder := binary.BigEndian.Uint64(data[60:68])
+	numEntries := binary.BigEndian.Uint16(data[68:70])
 
-	addressLen := int(binary.BigEndian.Uint16(data[38:40]))
-	if 40+addressLen > len(data) {
+	addressLen := int(binary.BigEndian.Uint16(data[70:72]))
+	if 72+addressLen > len(data) {
 		return 0, nil, io.ErrUnexpectedEOF
 	}
-	senderAddress := string(data[40 : 40+addressLen])
+	senderAddress := string(data[72 : 72+addressLen])
 
-	entryOffset := 40 + addressLen
+	entryOffset := 72 + addressLen
 
 	for i := 0; i < int(numEntries); i++ {
 		if entryOffset+2 > len(data) {
@@ -160,15 +260,19 @@ func decode(data []byte) (MessageType, *AppendEntriesMsg, error) {
 	}
 
 	message = &AppendEntriesMsg{
-		Term:          term,
-		IDofSender:    leaderID,
-		PrevLogIndex:  prevLogIndex,
-		Entries:       message.Entries,
-		PrevLogTerm:   prevLogTerm,
-		LeaderCommit:  leaderCommit,
-		Success:       success == 1,
-		CurrentTerm:   currentTerm,
-		SenderAddress: senderAddress,
+		Term:           term,
+		IDofSender:     leaderID,
+		PrevLogIndex:   prevLogIndex,
+		Entries:        message.Entries,
+		PrevLogTerm:    prevLogTerm,
+		LeaderCommit:   leaderCommit,
+		Success:        success == 1,
+		CurrentTerm:    currentTerm,
+		SenderAddress:  senderAddress,
+		Sequence:       sequence,
+		LinkReceived:   linkReceived,
+		LinkLost:       linkLost,
+		LinkOutOfOrder: linkOutOfOrder,
 	}
 	return MessageType(msgType), message, nil
 }
@@ -178,6 +282,8 @@ type Transport interface {
 	Receive() <-chan *Message
 	getAddress() string
 	Close() error
+	LossStats() map[string]LinkStats
+	MaxMessageBytes() int
 }
 
 // UDP transport
@@ -188,6 +294,9 @@ type UDPTransport struct {
 
 	addrMutex sync.Mutex
 	addrCache map[string]*net.UDPAddr
+
+	sendSeq     *linkSendSeq
+	recvTracker *linkRecvTracker
 }
 
 func setupUDPTransport(localAddress string, receiveBuffer int) (*UDPTransport, error) {
@@ -206,6 +315,8 @@ func setupUDPTransport(localAddress string, receiveBuffer int) (*UDPTransport, e
 		recvCh:       make(chan *Message, receiveBuffer),
 		conn:         conn,
 		addrCache:    make(map[string]*net.UDPAddr),
+		sendSeq:      newLinkSendSeq(),
+		recvTracker:  newLinkRecvTracker(),
 	}
 
 	go transport.busyReceiver()
@@ -239,6 +350,7 @@ func (udpTransport *UDPTransport) resolveCached(address string) (*net.UDPAddr, e
 
 func (udpTransport *UDPTransport) Send(address string, msg *Message) error {
 	msg.Body.SenderAddress = udpTransport.localAddress
+	msg.Body.Sequence = udpTransport.sendSeq.next(address)
 	data, err := encode(msg.Type, msg.Body)
 	if err != nil {
 		return err
@@ -265,9 +377,17 @@ func (udpTransport *UDPTransport) Close() error {
 	return udpTransport.conn.Close()
 }
 
+func (udpTransport *UDPTransport) LossStats() map[string]LinkStats {
+	return udpTransport.recvTracker.snapshot()
+}
+
+// Over 10000, so that its possible to exceed 9000 byte jumbo frames
+func (udpTransport *UDPTransport) MaxMessageBytes() int {
+	return 10200
+}
+
 func (udpTransport *UDPTransport) busyReceiver() {
-	// Reminder to check in raft protocol that messages > 9000 bytes (-headers) are never sent
-	buffer := make([]byte, 9000)
+	buffer := make([]byte, 11000)
 	for {
 		length, _, err := udpTransport.conn.ReadFromUDP(buffer)
 		if err != nil {
@@ -284,6 +404,7 @@ func (udpTransport *UDPTransport) busyReceiver() {
 
 		select {
 		case udpTransport.recvCh <- &Message{Type: msgType, Body: msg, RemoteAddress: msg.SenderAddress}:
+			udpTransport.recvTracker.record(msg.SenderAddress, msg.Sequence)
 		default:
 			continue
 		}
@@ -306,6 +427,9 @@ type TCPTransport struct {
 
 	acceptedMutex sync.Mutex
 	accepted      []net.Conn
+
+	sendSeq     *linkSendSeq
+	recvTracker *linkRecvTracker
 }
 
 func setupTCPTransport(localAddress string, receiveBuffer int) (*TCPTransport, error) {
@@ -319,6 +443,8 @@ func setupTCPTransport(localAddress string, receiveBuffer int) (*TCPTransport, e
 		recvCh:       make(chan *Message, receiveBuffer),
 		listener:     listener,
 		conns:        make(map[string]*pooledConn),
+		sendSeq:      newLinkSendSeq(),
+		recvTracker:  newLinkRecvTracker(),
 	}
 	go transport.acceptLoop()
 
@@ -361,6 +487,7 @@ func (transport *TCPTransport) readLoop(conn net.Conn) {
 		if err != nil {
 			continue
 		}
+		transport.recvTracker.record(msg.SenderAddress, msg.Sequence)
 
 		transport.recvCh <- &Message{Type: msgType, Body: msg, RemoteAddress: msg.SenderAddress}
 	}
@@ -407,6 +534,7 @@ func (transport *TCPTransport) dropConn(address string, entry *pooledConn) {
 
 func (transport *TCPTransport) Send(address string, msg *Message) error {
 	msg.Body.SenderAddress = transport.localAddress
+	msg.Body.Sequence = transport.sendSeq.next(address)
 	data, err := encode(msg.Type, msg.Body)
 	if err != nil {
 		return err
@@ -450,4 +578,12 @@ func (transport *TCPTransport) Close() error {
 	transport.acceptedMutex.Unlock()
 
 	return err
+}
+
+func (transport *TCPTransport) LossStats() map[string]LinkStats {
+	return transport.recvTracker.snapshot()
+}
+
+func (transport *TCPTransport) MaxMessageBytes() int {
+	return 1 << 20 // 1 MiB
 }
