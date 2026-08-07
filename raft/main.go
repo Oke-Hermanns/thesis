@@ -21,6 +21,8 @@ func main() {
 		runLeader(os.Args[2:])
 	case "Follower":
 		runFollower(os.Args[2:])
+	case "Bench":
+		runBenchClient(os.Args[2:])
 	default:
 		printUsage()
 		os.Exit(1)
@@ -29,13 +31,19 @@ func main() {
 
 func printUsage() {
 	fmt.Println("usage:")
-	fmt.Println("raft Leader <id> <raft-address:port> <client-address:port> <udp|tcp> [config flags]")
+	fmt.Println("raft Leader <id> <raft-address:port> <udp|tcp> [config flags]")
 	fmt.Println("raft Follower <id> <raft-address:port> <leader-raft-address:port> <udp|tcp> [config flags]")
+	fmt.Println("raft Bench <socket-path> latency [duration-seconds] [value-size]")
+	fmt.Println("raft Bench <socket-path> throughput [duration-seconds] [workers] [value-size] [rate-per-worker] [pprof-output-path]")
+	fmt.Println("[rate-per-worker] is the number of requests per second each worker should send, 0 for unlimited")
+	fmt.Println("[pprof-output-path], if set, captures a CPU profile for exactly the throughput run's duration")
+	fmt.Println("raft Bench <socket-path> get <key>")
 	fmt.Println()
 	fmt.Println("config flags (a -profile preset first, explicit flags override single values):")
 	fmt.Println("  -profile <name>       deployment scenario: " + strings.Join(profileNames(), ", ") + " (default datacenter)")
 	fmt.Println("  -heartbeat <dur>      override heartbeat interval, e.g. 200ms")
 	fmt.Println("  -join-retry <dur>     override join retry interval")
+	fmt.Println("  -bench-sock <path>    Unix socket for the Bench command (.sock file)")
 }
 
 func profileNames() []string {
@@ -47,11 +55,12 @@ func profileNames() []string {
 	return names
 }
 
-func parseConfig(flagArgs []string) config {
+func parseConfigAndBenchSocket(flagArgs []string) (config, string) {
 	fs := flag.NewFlagSet("config", flag.ExitOnError)
 	profile := fs.String("profile", "datacenter", "deployment scenario: "+strings.Join(profileNames(), ", "))
 	heartbeat := fs.Duration("heartbeat", 0, "override heartbeat interval")
 	joinRetry := fs.Duration("join-retry", 0, "override join retry interval")
+	benchSocket := fs.String("bench-sock", "/tmp/benchmarks.sock", "Unix socket for the Bench command")
 	fs.Parse(flagArgs)
 
 	cfg, ok := configProfiles[*profile]
@@ -72,7 +81,7 @@ func parseConfig(flagArgs []string) config {
 	fmt.Printf("config: profile=%s heartbeat=%s join-retry=%s\n",
 		*profile, cfg.HeartbeatTimeout, cfg.JoinRetryTimeout)
 
-	return cfg
+	return cfg, *benchSocket
 }
 
 func startNode(id uint8, raftAddress string, t string, cfg config) *RaftNode {
@@ -99,7 +108,7 @@ func startNode(id uint8, raftAddress string, t string, cfg config) *RaftNode {
 }
 
 func runLeader(args []string) {
-	if len(args) < 4 {
+	if len(args) < 3 {
 		printUsage()
 		os.Exit(1)
 	}
@@ -109,18 +118,17 @@ func runLeader(args []string) {
 		return
 	}
 	raftAddress := args[1]
-	clientAddress := args[2]
-	transport := args[3]
-	cfg := parseConfig(args[4:])
+	transport := args[2]
+	cfg, benchSocket := parseConfigAndBenchSocket(args[3:])
 
 	node := startNode(uint8(id), raftAddress, transport, cfg)
 	node.makeLeader()
 
-	if _, err := setupClientServer(clientAddress, node); err != nil {
+	if _, err := startBenchServer(node, benchSocket); err != nil {
 		panic(err)
 	}
 
-	fmt.Printf("leader %d: raft=%s client=%s\n", id, raftAddress, clientAddress)
+	fmt.Printf("leader %d: raft=%s bench-socket=%s\n", id, raftAddress, benchSocket)
 	select {}
 }
 
@@ -137,11 +145,15 @@ func runFollower(args []string) {
 	raftAddress := args[1]
 	leaderAddress := args[2]
 	transport := args[3]
-	cfg := parseConfig(args[4:])
+	cfg, benchSocket := parseConfigAndBenchSocket(args[4:])
 
 	node := startNode(uint8(id), raftAddress, transport, cfg)
 	node.makeFollower(leaderAddress)
 
-	fmt.Printf("follower %d: raft=%s leader=%s\n", id, raftAddress, leaderAddress)
+	if _, err := startBenchServer(node, benchSocket); err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("follower %d: raft=%s leader=%s bench-socket=%s\n", id, raftAddress, leaderAddress, benchSocket)
 	select {}
 }

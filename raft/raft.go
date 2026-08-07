@@ -15,11 +15,7 @@ const (
 	Follower
 )
 
-const (
-	Put operation = iota + 1
-	Get
-	Del
-)
+const Put operation = 1
 
 type RaftNode struct {
 	Role        role
@@ -32,16 +28,18 @@ type RaftNode struct {
 	Config      config
 
 	// For leader only
-	NextIndex   map[uint8]uint64
-	MatchIndex  map[uint8]uint64
-	Peers       []peer
-	Replicators map[uint8]chan struct{}
+	NextIndex            map[uint8]uint64
+	MatchIndex           map[uint8]uint64
+	Peers                []peer
+	Replicators          map[uint8]chan struct{}
+	FollowerReportedLoss map[uint8]LinkStats
+
 	// For follower only
 	LeaderAddress string
 
 	Mutex        sync.Mutex
 	NewCommit    *sync.Cond
-	stateMachine *kvFsm
+	StateMachine *kvFsm
 
 	// For follower only, closed when leader acknowledges join
 	Joined   chan struct{}
@@ -50,15 +48,16 @@ type RaftNode struct {
 
 func createNode(id uint8, transport Transport, config config, stateMachine *kvFsm) *RaftNode {
 	node := &RaftNode{
-		Id:           id,
-		Transport:    transport,
-		Config:       config,
-		Log:          []LogEntry{},
-		stateMachine: stateMachine,
-		NextIndex:    make(map[uint8]uint64),
-		MatchIndex:   make(map[uint8]uint64),
-		Replicators:  make(map[uint8]chan struct{}),
-		Joined:       make(chan struct{}),
+		Id:                   id,
+		Transport:            transport,
+		Config:               config,
+		Log:                  []LogEntry{},
+		StateMachine:         stateMachine,
+		NextIndex:            make(map[uint8]uint64),
+		MatchIndex:           make(map[uint8]uint64),
+		Replicators:          make(map[uint8]chan struct{}),
+		FollowerReportedLoss: make(map[uint8]LinkStats),
+		Joined:               make(chan struct{}),
 	}
 	node.NewCommit = sync.NewCond(&node.Mutex)
 	return node
@@ -137,8 +136,7 @@ func (node *RaftNode) startReplicator(id uint8) {
 // Sends to a specific follower, checks based on Raft paper conditions if entries have to be send
 // If no entries have to be send to the follower, the payload is empty, which is the definition of a heartbeat message
 func (node *RaftNode) sendAppendEntriesToFollower(id uint8) {
-	// 8000 should work for all cloud environments with jumbo frames enabled
-	const maxEntriesBytes = 8000
+	maxBytes := node.Transport.MaxMessageBytes()
 	node.Mutex.Lock()
 	address := ""
 	for _, p := range node.Peers {
@@ -161,7 +159,7 @@ func (node *RaftNode) sendAppendEntriesToFollower(id uint8) {
 	entriesSize := 0
 	for i := nextIndex; i < logLength; i++ {
 		entrySize := 14 + len(node.Log[i].Payload)
-		if entrySize+entriesSize > maxEntriesBytes {
+		if len(entries) > 0 && entrySize+entriesSize > maxBytes {
 			break
 		}
 		entries = append(entries, node.Log[i])
@@ -178,47 +176,8 @@ func (node *RaftNode) sendAppendEntriesToFollower(id uint8) {
 	}
 	node.Mutex.Unlock()
 
-	node.Transport.Send(address, &Message{AppendEntries, appendEntry, address})
-}
-
-// Check if request is valid and if that is the case, apply the command to the leader
-func (node *RaftNode) handleClientRequest(req *clientRequest) *clientResponse {
-	node.Mutex.Lock()
-	isLeader := node.Role == Leader
-	leaderHint := node.LeaderAddress
-	node.Mutex.Unlock()
-
-	if !isLeader {
-		return &clientResponse{Success: false, LeaderHint: leaderHint, Error: "not leader"}
-	}
-
-	switch req.Op {
-	case Get:
-		value, found := node.stateMachine.Get(req.Key)
-		if !found {
-			return &clientResponse{Success: false, Error: "key not found"}
-		}
-		return &clientResponse{Success: true, Value: value.([]byte)}
-	case Put:
-		index, err := node.applyCommandToLeader(Put, encodeCommand(Put, req.Key, req.Value))
-		if err != nil {
-			return &clientResponse{Success: false, Error: err.Error()}
-		}
-		node.awaitAppliedToStateMachine(index)
-		return &clientResponse{Success: true}
-	case Del:
-		value, found := node.stateMachine.Get(req.Key)
-		if !found {
-			return &clientResponse{Success: false, Error: "key not found"}
-		}
-		index, err := node.applyCommandToLeader(Del, encodeCommand(Del, req.Key, nil))
-		if err != nil {
-			return &clientResponse{Success: false, Error: err.Error()}
-		}
-		node.awaitAppliedToStateMachine(index)
-		return &clientResponse{Success: true, Value: value.([]byte)}
-	default:
-		return &clientResponse{Success: false, Error: "currently unsupported operation"}
+	if err := node.Transport.Send(address, &Message{AppendEntries, appendEntry, address}); err != nil {
+		log.Printf("Failed to send AppendEntries to %s: %v", address, err)
 	}
 }
 
@@ -229,7 +188,7 @@ func (node *RaftNode) applyCommandToLeader(op operation, data any) (uint64, erro
 		node.Mutex.Unlock()
 		return 0, fmt.Errorf("not leader")
 	}
-	if op != Put && op != Del {
+	if op != Put {
 		node.Mutex.Unlock()
 		return 0, fmt.Errorf("invalid operation")
 	}
@@ -237,6 +196,10 @@ func (node *RaftNode) applyCommandToLeader(op operation, data any) (uint64, erro
 	if !ok {
 		node.Mutex.Unlock()
 		return 0, fmt.Errorf("failed to transform data to bytes")
+	}
+	if maxBytes := node.Transport.MaxMessageBytes(); 14+len(transformedData) > maxBytes {
+		node.Mutex.Unlock()
+		return 0, fmt.Errorf("Payload too large")
 	}
 	entry := LogEntry{
 		Term:    node.CurrentTerm,
@@ -263,6 +226,20 @@ func (node *RaftNode) applyCommandToLeader(op operation, data any) (uint64, erro
 	return entry.Index, nil
 }
 
+func (node *RaftNode) lossSnapshot() ([]peer, map[uint8]LinkStats) {
+	node.Mutex.Lock()
+	defer node.Mutex.Unlock()
+
+	peers := make([]peer, len(node.Peers))
+	copy(peers, node.Peers)
+
+	downlink := make(map[uint8]LinkStats, len(node.FollowerReportedLoss))
+	for id, s := range node.FollowerReportedLoss {
+		downlink[id] = s
+	}
+	return peers, downlink
+}
+
 // Block until index is applied to state machine, avoids get after put issues
 func (node *RaftNode) awaitAppliedToStateMachine(index uint64) {
 	node.Mutex.Lock()
@@ -274,6 +251,10 @@ func (node *RaftNode) awaitAppliedToStateMachine(index uint64) {
 
 // Append Entries to Follower if term and previous log index allow it
 func (node *RaftNode) followerHandleAppendEntries(msg *Message) {
+	if node.Role != Follower {
+		log.Println("Leader is not allowed to call followerHandleAppendEntries")
+		return
+	}
 	if msg.Type != AppendEntries {
 		log.Println("A follower can only handle AppendEntries, no AppendEntriesResponse")
 		return
@@ -352,6 +333,7 @@ func (node *RaftNode) leaderHandleAppendEntriesResponse(msg *Message) {
 		log.Printf("The node with address %s is currently not known", followerAddress)
 		return
 	}
+	node.FollowerReportedLoss[followerIndex] = LinkStats{Received: response.LinkReceived, Lost: response.LinkLost, OutOfOrder: response.LinkOutOfOrder}
 	if response.Success {
 		matchIndex := response.PrevLogIndex
 		if matchIndex > node.MatchIndex[followerIndex] {
@@ -369,12 +351,17 @@ func (node *RaftNode) leaderHandleAppendEntriesResponse(msg *Message) {
 
 // Notify leader about status of AppendEntries request
 func (node *RaftNode) followerSendAppendEntriesResponse(success bool, logLength uint64, term uint32) {
+	linkStats := node.Transport.LossStats()[node.LeaderAddress]
+
 	resp := &Message{
 		Type: AppendEntriesResponse,
 		Body: &AppendEntriesMsg{
-			CurrentTerm:  term,
-			Success:      success,
-			PrevLogIndex: logLength,
+			CurrentTerm:    term,
+			Success:        success,
+			PrevLogIndex:   logLength,
+			LinkReceived:   linkStats.Received,
+			LinkLost:       linkStats.Lost,
+			LinkOutOfOrder: linkStats.OutOfOrder,
 		},
 		RemoteAddress: node.Transport.getAddress(),
 	}
@@ -411,7 +398,7 @@ func (node *RaftNode) applyCommittedEntries() {
 	for node.LastApplied < node.CommitIndex {
 		entry := node.Log[node.LastApplied]
 		node.Mutex.Unlock()
-		err := node.stateMachine.Apply(entry)
+		err := node.StateMachine.Apply(entry)
 		if err != nil {
 			log.Panicf("Failed to apply entry %d: %v", entry.Index, err)
 		}
@@ -481,6 +468,10 @@ func (node *RaftNode) sendJoin() {
 }
 
 func (node *RaftNode) leaderHandleJoin(msg *Message) {
+	if node.Role != Leader {
+		log.Println("Follower is not allowed to call leaderHandleJoin")
+		return
+	}
 	id := uint8(msg.Body.IDofSender)
 	address := msg.RemoteAddress
 
@@ -516,5 +507,9 @@ func (node *RaftNode) leaderSendJoinResponse(followerAddress string) {
 }
 
 func (node *RaftNode) followerHandleJoinResponse() {
+	if node.Role != Follower {
+		log.Println("Leader is not allowed to call followerHandleJoinResponse")
+		return
+	}
 	node.JoinOnce.Do(func() { close(node.Joined) })
 }
