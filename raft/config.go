@@ -15,12 +15,10 @@ type config struct {
 	JoinRetryTimeout time.Duration
 }
 
-//	close       same datacenter, nodes as close as possible (depends on cloud provider)
-//	datacenter  same datacenter
-//	zone        different zones, same region
-//	region      different regions
-//
-// TODO: The Heartbeat timeouts have to be adjusted before aws/gcp testing!
+// close       same datacenter, nodes as close as possible (depends on cloud provider)
+// datacenter  same datacenter
+// zone        different zones, same region
+// region      different regions
 var configProfiles = map[string]config{
 	"close": {
 		HeartbeatTimeout: 10 * time.Millisecond,
@@ -35,7 +33,7 @@ var configProfiles = map[string]config{
 		JoinRetryTimeout: 500 * time.Millisecond,
 	},
 	"region": {
-		HeartbeatTimeout: 1000 * time.Millisecond,
+		HeartbeatTimeout: 1500 * time.Millisecond,
 		JoinRetryTimeout: 2000 * time.Millisecond,
 	},
 }
