@@ -386,7 +386,7 @@ func (udpTransport *UDPTransport) MaxMessageBytes() int {
 }
 
 func (udpTransport *UDPTransport) busyReceiver() {
-	buffer := make([]byte, 11000)
+	buffer := make([]byte, 9000)
 	for {
 		length, _, err := udpTransport.conn.ReadFromUDP(buffer)
 		if err != nil {
