@@ -381,9 +381,8 @@ func (udpTransport *UDPTransport) LossStats() map[string]LinkStats {
 	return udpTransport.recvTracker.snapshot()
 }
 
-// Over 10000, so that its possible to exceed 9000 byte jumbo frames
 func (udpTransport *UDPTransport) MaxMessageBytes() int {
-	return 10200
+	return 8000
 }
 
 func (udpTransport *UDPTransport) busyReceiver() {
