@@ -8,8 +8,7 @@ import (
 )
 
 type kvFsm struct {
-	dbMutex sync.RWMutex
-	db      *sync.Map
+	db *sync.Map
 }
 
 func encodeCommand(op operation, key string, value []byte) []byte {
@@ -43,15 +42,11 @@ func (kf *kvFsm) Apply(entry LogEntry) error {
 	if op != Put {
 		return fmt.Errorf("Only put is currently supported")
 	}
-	kf.dbMutex.Lock()
-	defer kf.dbMutex.Unlock()
 	kf.db.Store(key, value)
 	return nil
 }
 
 func (kf *kvFsm) Get(key string) (any, bool) {
-	kf.dbMutex.RLock()
-	defer kf.dbMutex.RUnlock()
 	val, b := kf.db.Load(key)
 	return val, b
 }
