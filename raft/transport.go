@@ -382,7 +382,7 @@ func (udpTransport *UDPTransport) LossStats() map[string]LinkStats {
 }
 
 func (udpTransport *UDPTransport) MaxMessageBytes() int {
-	return 8000
+	return 8100
 }
 
 func (udpTransport *UDPTransport) busyReceiver() {

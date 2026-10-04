@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strconv"
@@ -61,6 +62,10 @@ func (server *benchServer) handleConn(conn net.Conn) {
 		server.runThroughput(conn, fields[1:])
 	case "get":
 		server.runGet(conn, fields[1:])
+	case "status":
+		server.runStatus(conn)
+	case "kernelstats":
+		server.runKernelStats(conn)
 	default:
 		fmt.Fprintln(conn, "Unknown command")
 	}
@@ -102,6 +107,29 @@ func (server *benchServer) runGet(conn net.Conn, args []string) {
 	fmt.Fprintf(conn, "%s = %q\n", key, value.([]byte))
 }
 
+func (server *benchServer) runStatus(conn net.Conn) {
+	peers, _ := server.node.lossSnapshot()
+
+	role := "follower"
+	if server.node.Role == Leader {
+		role = "leader"
+	}
+
+	fmt.Fprintf(conn, "role=%s peers=%d\n", role, len(peers))
+	for _, p := range peers {
+		fmt.Fprintf(conn, "peer %d %s\n", p.Id, p.Address)
+	}
+}
+
+func (server *benchServer) runKernelStats(conn net.Conn) {
+	stats, ok := readKernelUDPStats()
+	if !ok {
+		fmt.Fprintln(conn, "kernel UDP stats unavailable (requires Linux /proc/net/snmp)")
+		return
+	}
+	fmt.Fprintf(conn, "InErrors=%d RcvbufErrors=%d\n", stats.InErrors, stats.RcvbufErrors)
+}
+
 func (server *benchServer) runLatency(conn net.Conn, args []string) {
 	if len(args) < 2 {
 		fmt.Fprintln(conn, "Usage: Latency <duration-seconds> <value-size>")
@@ -123,6 +151,7 @@ func (server *benchServer) runLatency(conn net.Conn, args []string) {
 	var latencies []time.Duration
 
 	lossStart := server.captureLossWindow()
+	kernelStart, kernelStartOK := readKernelUDPStats()
 
 	start := time.Now()
 	for i := 0; time.Since(start) < duration; i++ {
@@ -139,9 +168,19 @@ func (server *benchServer) runLatency(conn net.Conn, args []string) {
 	elapsed := time.Since(start)
 
 	lossEnd := server.captureLossWindow()
+	kernelEnd, kernelEndOK := readKernelUDPStats()
 
 	latencyReport(conn, latencies, elapsed)
 	lossReport(conn, lossStart, lossEnd)
+	kernelUDPReport(conn, kernelStartOK, kernelEndOK, kernelStart, kernelEnd)
+}
+
+const outlierLatencyThreshold = 150 * time.Millisecond
+
+type outlierEntry struct {
+	At      time.Time
+	Latency time.Duration
+	Worker  int
 }
 
 func (server *benchServer) runThroughput(conn net.Conn, args []string) {
@@ -186,6 +225,8 @@ func (server *benchServer) runThroughput(conn net.Conn, args []string) {
 
 	var mu sync.Mutex
 	var allLatencies []time.Duration
+	var allSchedDelays []time.Duration
+	var allOutliers []outlierEntry
 	perWorker := make([]int, workers)
 	var firstErr error
 
@@ -193,13 +234,23 @@ func (server *benchServer) runThroughput(conn net.Conn, args []string) {
 	var wg sync.WaitGroup
 
 	lossStart := server.captureLossWindow()
+	kernelStart, kernelStartOK := readKernelUDPStats()
+
+	useSpinPacer := interval > 0 && os.Getenv("RAFT_PACER") != "sleep"
+	var slots chan time.Time
 
 	start := time.Now()
+	if useSpinPacer {
+		slots = make(chan time.Time, 8192)
+		go runPacer(start, interval/time.Duration(workers), slots, stop)
+	}
 	for w := range workers {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			var local []time.Duration
+			var localSched []time.Duration
+			var localOutliers []outlierEntry
 			i := 0
 			nextSend := time.Now()
 			for {
@@ -207,12 +258,27 @@ func (server *benchServer) runThroughput(conn net.Conn, args []string) {
 				case <-stop:
 					mu.Lock()
 					allLatencies = append(allLatencies, local...)
+					allSchedDelays = append(allSchedDelays, localSched...)
+					allOutliers = append(allOutliers, localOutliers...)
 					perWorker[workerID] = len(local)
 					mu.Unlock()
 					return
 				default:
 				}
-				if interval > 0 {
+				scheduled := nextSend
+				if useSpinPacer {
+					slot, ok := <-slots
+					if !ok {
+						mu.Lock()
+						allLatencies = append(allLatencies, local...)
+						allSchedDelays = append(allSchedDelays, localSched...)
+						allOutliers = append(allOutliers, localOutliers...)
+						perWorker[workerID] = len(local)
+						mu.Unlock()
+						return
+					}
+					scheduled = slot
+				} else if interval > 0 {
 					if now := time.Now(); now.Before(nextSend) {
 						time.Sleep(nextSend.Sub(now))
 					}
@@ -221,6 +287,9 @@ func (server *benchServer) runThroughput(conn net.Conn, args []string) {
 				i++
 				key := fmt.Sprintf("benchkey-w%d-%d", workerID, i)
 				reqStart := time.Now()
+				if interval == 0 {
+					scheduled = reqStart
+				}
 				index, err := server.node.applyCommandToLeader(Put, encodeCommand(Put, key, value))
 				if err != nil {
 					mu.Lock()
@@ -228,12 +297,19 @@ func (server *benchServer) runThroughput(conn net.Conn, args []string) {
 						firstErr = err
 					}
 					allLatencies = append(allLatencies, local...)
+					allSchedDelays = append(allSchedDelays, localSched...)
+					allOutliers = append(allOutliers, localOutliers...)
 					perWorker[workerID] = len(local)
 					mu.Unlock()
 					return
 				}
 				server.node.awaitAppliedToStateMachine(index)
-				local = append(local, time.Since(reqStart))
+				lat := time.Since(scheduled)
+				localSched = append(localSched, reqStart.Sub(scheduled))
+				local = append(local, lat)
+				if interval > 0 && lat > outlierLatencyThreshold {
+					localOutliers = append(localOutliers, outlierEntry{At: time.Now(), Latency: lat, Worker: workerID})
+				}
 			}
 		}(w)
 	}
@@ -249,19 +325,52 @@ func (server *benchServer) runThroughput(conn net.Conn, args []string) {
 	}
 
 	lossEnd := server.captureLossWindow()
+	kernelEnd, kernelEndOK := readKernelUDPStats()
 
 	fmt.Fprintf(conn, "\n%d workers over %s", workers, elapsed)
 	if interval > 0 {
-		fmt.Fprintf(conn, " (target %.1f req/sec/worker)", ratePerWorker)
+		fmt.Fprintf(conn, " (open loop, target %.1f req/sec/worker, latency measured from intended send time)", ratePerWorker)
+	} else {
+		fmt.Fprintf(conn, " (closed loop)")
 	}
 	fmt.Fprintln(conn)
+
+	if interval > 0 {
+		offered := ratePerWorker * float64(workers)
+		achieved := float64(len(allLatencies)) / elapsed.Seconds()
+		verdict := "SUSTAINED"
+		if achieved < offered*0.95 {
+			verdict = "NOT SUSTAINED - offered load exceeds capacity"
+		}
+		fmt.Fprintf(conn, "offered=%.1f/sec achieved=%.1f/sec (%.1f%% of offered) %s\n",
+			offered, achieved, 100*achieved/offered, verdict)
+	}
 	fmt.Fprintln(conn, "per-worker:")
 	for w, n := range perWorker {
 		fmt.Fprintf(conn, "  worker %d: %d ok, %.1f/sec\n", w, n, float64(n)/elapsed.Seconds())
 	}
 
 	latencyReport(conn, allLatencies, elapsed)
+	if interval > 0 {
+		schedDelayReport(conn, allSchedDelays)
+		outlierReport(conn, allOutliers)
+	}
 	lossReport(conn, lossStart, lossEnd)
+	kernelUDPReport(conn, kernelStartOK, kernelEndOK, kernelStart, kernelEnd)
+}
+
+func outlierReport(w io.Writer, outliers []outlierEntry) {
+	if len(outliers) == 0 {
+		fmt.Fprintf(w, "\nno requests exceeded the %s outlier threshold\n", outlierLatencyThreshold)
+		return
+	}
+	sort.Slice(outliers, func(i, j int) bool { return outliers[i].At.Before(outliers[j].At) })
+	fmt.Fprintf(w, "\n%d requests exceeded the %s outlier threshold (completion time UTC, latency, worker):\n",
+		len(outliers), outlierLatencyThreshold)
+	for _, o := range outliers {
+		fmt.Fprintf(w, "  %s  %10.3f ms  worker %d\n",
+			o.At.UTC().Format("2006-01-02T15:04:05.000Z"), float64(o.Latency.Microseconds())/1000, o.Worker)
+	}
 }
 
 type lossWindow struct {
@@ -302,6 +411,100 @@ func diffU64(end, start uint64) uint64 {
 		return end
 	}
 	return end - start
+}
+
+type kernelUDPStats struct {
+	InErrors     uint64
+	RcvbufErrors uint64
+}
+
+func readKernelUDPStats() (kernelUDPStats, bool) {
+	data, err := os.ReadFile("/proc/net/snmp")
+	if err != nil {
+		return kernelUDPStats{}, false
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		if !strings.HasPrefix(line, "Udp:") || i+1 >= len(lines) {
+			continue
+		}
+		header := strings.Fields(line)
+		values := strings.Fields(lines[i+1])
+		if len(header) != len(values) {
+			return kernelUDPStats{}, false
+		}
+		var stats kernelUDPStats
+		for j, name := range header {
+			switch name {
+			case "InErrors":
+				stats.InErrors, _ = strconv.ParseUint(values[j], 10, 64)
+			case "RcvbufErrors":
+				stats.RcvbufErrors, _ = strconv.ParseUint(values[j], 10, 64)
+			}
+		}
+		return stats, true
+	}
+	return kernelUDPStats{}, false
+}
+
+func kernelUDPReport(w io.Writer, startOK, endOK bool, start, end kernelUDPStats) {
+	if !startOK || !endOK {
+		return
+	}
+	fmt.Fprintf(w, "\nkernel UDP stats (system-wide, /proc/net/snmp, Linux only):\n")
+	fmt.Fprintf(w, "  InErrors delta:     %d\n", diffU64(end.InErrors, start.InErrors))
+	fmt.Fprintf(w, "  RcvbufErrors delta: %d  (socket receive buffer overflow - kernel-side loss, not network loss)\n",
+		diffU64(end.RcvbufErrors, start.RcvbufErrors))
+}
+
+func waitUntil(target time.Time) {
+	for time.Now().Before(target) {
+	}
+}
+
+func runPacer(start time.Time, interval time.Duration, slots chan<- time.Time, stop <-chan struct{}) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer close(slots)
+
+	for seq := int64(0); ; seq++ {
+		target := start.Add(time.Duration(seq) * interval)
+		waitUntil(target)
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		select {
+		case slots <- target:
+		case <-stop:
+			return
+		}
+	}
+}
+
+func schedDelayReport(w io.Writer, delays []time.Duration) {
+	if len(delays) == 0 {
+		return
+	}
+	sorted := make([]float64, len(delays))
+	var sum float64
+	for i, d := range delays {
+		sorted[i] = float64(d.Microseconds())
+		sum += sorted[i]
+	}
+	sort.Float64s(sorted)
+	pct := func(p float64) float64 {
+		idx := int(float64(len(sorted)) * p / 100)
+		if idx >= len(sorted) {
+			idx = len(sorted) - 1
+		}
+		return sorted[idx]
+	}
+	fmt.Fprintf(w, "\nscheduling delay (actual send minus scheduled send; load-generator timer error):\n")
+	fmt.Fprintf(w, "  avg=%.3f usec  p50=%.3f  p99=%.3f  max=%.3f\n",
+		sum/float64(len(sorted)), pct(50), pct(99), sorted[len(sorted)-1])
 }
 
 func lossPercent(received, lost uint64) float64 {
@@ -363,6 +566,8 @@ func runBenchClient(args []string) {
 		fmt.Println("usage: raft Bench <socket-path> latency [duration-seconds] [value-size]")
 		fmt.Println("       raft Bench <socket-path> throughput [duration-seconds] [workers] [value-size] [rate-per-worker] [pprof-output-path]")
 		fmt.Println("       raft Bench <socket-path> get <key>")
+		fmt.Println("       raft Bench <socket-path> status")
+		fmt.Println("       raft Bench <socket-path> kernelstats")
 		os.Exit(1)
 	}
 	socketPath := args[0]

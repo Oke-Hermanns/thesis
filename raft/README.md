@@ -17,7 +17,7 @@ For a three node cluster located in one datacenter:
 4. **Latency benchmark example from the leaders machine:**
    `./raft Bench /tmp/benchmarks.sock latency 30 64`
 
-5. **Througput benchmark example from the leaders machine:**
+5. **Throughput benchmark example from the leaders machine:**
    `./raft Bench /tmp/benchmarks.sock throughput 30 6 8000 0 /tmp/cpu.pprof`
 
 6. **Verify that a value is stored:**
